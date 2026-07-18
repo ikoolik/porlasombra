@@ -1,0 +1,8 @@
+{
+  "name": "shade-route-build",
+  "private": true,
+  "type": "module",
+  "description": "Offline precompute: Catastro buildings + OSM streets -> static routing artifact",
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "proj4": "^2.12.1" }
+}

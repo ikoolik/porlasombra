@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shade Route — prototype</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root { --panel: #ffffff; --ink: #1a1a1a; --muted: #666; --accent: #2f8f4e; --sun: #f4b400; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); }
+  #map { position: absolute; inset: 0; z-index: 0; }
+  #panel {
+    position: absolute; z-index: 1000; top: 12px; left: 12px; width: 340px; max-width: calc(100vw - 24px);
+    background: var(--panel); border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.18);
+    padding: 14px 16px; max-height: calc(100vh - 24px); overflow-y: auto;
+  }
+  h1 { font-size: 16px; margin: 0 0 2px; }
+  .sub { font-size: 12px; color: var(--muted); margin: 0 0 12px; line-height: 1.4; }
+  label { font-size: 12px; font-weight: 600; display: block; margin: 10px 0 4px; }
+  input[type="datetime-local"], select { width: 100%; padding: 7px 8px; font-size: 13px; border: 1px solid #ddd; border-radius: 8px; }
+  input[type="range"] { width: 100%; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  button {
+    width: 100%; padding: 10px; font-size: 14px; font-weight: 600; color: #fff; background: var(--accent);
+    border: none; border-radius: 9px; cursor: pointer; margin-top: 12px;
+  }
+  button.secondary { background: #eee; color: #333; }
+  button:disabled { opacity: .5; cursor: default; }
+  .steps { font-size: 12px; color: var(--muted); margin: 10px 0 0; padding-left: 16px; line-height: 1.5; }
+  .badge { display: inline-block; width: 20px; height: 20px; border-radius: 50%; color:#fff; text-align:center; line-height:20px; font-size:12px; font-weight:700; }
+  .badge.a { background:#2b6cb0; } .badge.b { background:#c53030; }
+  #results { margin-top: 12px; font-size: 13px; }
+  .route-card { border:1px solid #eee; border-radius:9px; padding:8px 10px; margin-top:8px; }
+  .route-card.best { border-color: var(--accent); background: #f2fbf5; }
+  .route-card b { font-size: 14px; }
+  .bar { height:7px; border-radius:4px; background:#eee; margin-top:5px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--accent); }
+  #status { font-size:12px; color: var(--muted); margin-top:10px; min-height: 16px; }
+  .legend { position:absolute; z-index:1000; bottom:14px; left:12px; background:#fff; padding:8px 10px; border-radius:8px; font-size:11px; box-shadow:0 3px 12px rgba(0,0,0,.15); line-height:1.7; }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:-1px; margin-right:5px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <h1>☀️ Shade Route <span style="font-weight:400;font-size:12px;color:var(--muted)">prototype</span></h1>
+  <p class="sub">Finds the <b>shadiest walking route</b> between two points in Valencia — including <b>which side of the street</b> to walk on. Building heights come from the <b>Spanish Cadastre</b>, streets from OpenStreetMap, both baked into one precomputed file. Shadows and routing run <b>entirely in your browser</b>. No API keys, no server.</p>
+
+  <label for="dt">Date & time</label>
+  <div class="row">
+    <input type="datetime-local" id="dt" />
+    <button class="secondary" id="nowBtn" style="margin-top:0;flex:0 0 64px;">Now</button>
+  </div>
+
+  <label for="hour">Scrub time of day: <span id="hourLbl"></span></label>
+  <input type="range" id="hour" min="0" max="1439" step="5" />
+
+  <label for="alpha">Shade preference: <span id="alphaLbl"></span></label>
+  <input type="range" id="alpha" min="0" max="4" step="0.1" value="1.2" />
+
+  <ol class="steps">
+    <li>Click the map to drop <span class="badge a">A</span> (start), then <span class="badge b">B</span> (end). Markers are draggable.</li>
+    <li>Press <b>Find shady route</b>.</li>
+  </ol>
+
+  <button id="findBtn" disabled>Find shady route</button>
+  <button class="secondary" id="shadeBtn">Show shadows only (current view)</button>
+
+  <div id="results"></div>
+  <div id="status"></div>
+</div>
+
+<div class="legend">
+  <div><span class="swatch" style="background:#3b3b5c;opacity:.5"></span>Building shadow</div>
+  <div><span class="swatch" style="background:#2f8f4e"></span>Shadiest route (shaded part)</div>
+  <div><span class="swatch" style="background:#f4b400"></span>Sun-exposed segment</div>
+  <div><span class="swatch" style="background:#888"></span>Shortest route (comparison)</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
+<script>
+// ---------- Config ----------
+// The sidewalk graph, the walkability rules and the crossing penalties all live in the build
+// step now (see build/) — this file only consumes the artifact it produces.
+const VALENCIA = [39.4699, -0.3763];
+const SAMPLES_PER_EDGE = 3;   // sun samples along each graph edge
+
+// ---------- Map ----------
+const map = L.map("map").setView(VALENCIA, 16);
+// Attribution covers all three uses, not just the tiles: the street network and the sidewalk
+// graph derived from it are OSM (ODbL requires crediting a derived database), and every building
+// footprint and height comes from the Spanish Cadastre.
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · ' +
+               'buildings © <a href="https://www.catastro.hacienda.gob.es/">Dirección General del Catastro</a>',
+}).addTo(map);
+
+// One canvas layer for every shadow, rather than one Leaflet object per polygon.
+//
+// Two reasons. Speed: a dense Valencia viewport holds ~20k shadows and per-object overhead cost
+// seconds. Correctness: shade is binary — a spot is either shadowed or it isn't — but stacked
+// translucent polygons compound their alpha, so overlapping shadows drew darker than single ones
+// and implied a gradient that does not exist. See _redraw for how both are solved at once.
+const ShadowCanvas = L.Layer.extend({
+  initialize(opts) { this._polys = []; this._opts = opts || {}; },
+
+  onAdd(map) {
+    this._map = map;
+    this._canvas = L.DomUtil.create("canvas", "leaflet-layer");
+    this._canvas.style.pointerEvents = "none";
+    this._ctx = this._canvas.getContext("2d");
+    map.getPanes().overlayPane.appendChild(this._canvas);
+    map.on("moveend zoomend resize", this._reset, this);
+    if (map.options.zoomAnimation && L.Browser.any3d) map.on("zoomanim", this._animateZoom, this);
+    this._reset();
+  },
+
+  onRemove(map) {
+    L.DomUtil.remove(this._canvas);
+    map.off("moveend zoomend resize", this._reset, this);
+    map.off("zoomanim", this._animateZoom, this);
+  },
+
+  setPolys(polys) { this._polys = polys || []; this._redraw(); },
+  count() { return this._polys.length; },
+
+  // Match Leaflet's own zoom animation so the shade does not detach mid-zoom.
+  _animateZoom(e) {
+    const scale = this._map.getZoomScale(e.zoom, this._map.getZoom());
+    const offset = this._map._latLngBoundsToNewLayerBounds(this._map.getBounds(), e.zoom, e.center).min;
+    L.DomUtil.setTransform(this._canvas, offset, scale);
+  },
+
+  _reset() {
+    const size = this._map.getSize();
+    const dpr = window.devicePixelRatio || 1;
+    L.DomUtil.setTransform(this._canvas, L.point(0, 0), 1);
+    L.DomUtil.setPosition(this._canvas, this._map.containerPointToLayerPoint([0, 0]));
+    this._canvas.width = size.x * dpr;
+    this._canvas.height = size.y * dpr;
+    this._canvas.style.width = size.x + "px";
+    this._canvas.style.height = size.y + "px";
+    this._ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this._redraw();
+  },
+
+  _redraw() {
+    const size = this._map.getSize(), ctx = this._ctx;
+    // The map can have no layout yet (hidden tab, container not sized). Drawing into a 0×0
+    // canvas throws on drawImage, so wait for a real size — _reset will call us again.
+    if (!size.x || !size.y) return;
+    ctx.clearRect(0, 0, size.x, size.y);
+    if (!this._polys.length) return;
+
+    // Project inline rather than via map.latLngToContainerPoint. There are ~200k vertices on
+    // screen and Leaflet allocates a Point object per call, which cost ~2.8 s; this is Leaflet's
+    // own Web Mercator maths (EPSG:3857, 256 px tiles) with no allocation.
+    const scale = 256 * Math.pow(2, this._map.getZoom());
+    const D = Math.PI / 180, TWO_PI = 2 * Math.PI;
+    const projX = (lng) => scale * ((lng + 180) / 360);
+    const projY = (lat) => {
+      const s = Math.max(Math.min(Math.sin(lat * D), 1 - 1e-15), -1 + 1e-15);
+      return scale * (0.5 - Math.log((1 + s) / (1 - s)) / (2 * TWO_PI));
+    };
+    const nw = this._map.getBounds().getNorthWest();
+    const ox = projX(nw.lng), oy = projY(nw.lat);
+
+    // Each polygon is filled *opaquely* onto an offscreen canvas, so overlaps overwrite instead
+    // of stacking alpha, and the whole thing is composited once at the target opacity. That keeps
+    // shade uniform (it is binary — you are in it or you are not) at a single flat tone.
+    //
+    // Per-polygon paths, not one combined path: accumulating ~200k segments into a single Path2D
+    // costs ~2.8 s, while 24k small paths fill in ~28 ms. The giant path is slow to *build*, not
+    // to rasterise.
+    const dpr = window.devicePixelRatio || 1;
+    const off = this._offscreen || (this._offscreen = document.createElement("canvas"));
+    if (off.width !== this._canvas.width || off.height !== this._canvas.height) {
+      off.width = this._canvas.width;
+      off.height = this._canvas.height;
+    }
+    const octx = off.getContext("2d");
+    octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    octx.clearRect(0, 0, size.x, size.y);
+    octx.fillStyle = this._opts.fill || "#3b3b5c";
+    for (const poly of this._polys) {
+      const path = new Path2D();
+      path.moveTo(projX(poly[0][0]) - ox, projY(poly[0][1]) - oy);
+      for (let i = 1; i < poly.length; i++) {
+        path.lineTo(projX(poly[i][0]) - ox, projY(poly[i][1]) - oy);
+      }
+      path.closePath();
+      octx.fill(path);
+    }
+    ctx.globalAlpha = this._opts.alpha ?? 0.3;
+    ctx.drawImage(off, 0, 0, size.x, size.y);
+    ctx.globalAlpha = 1;
+  },
+});
+
+const shadowLayer = new ShadowCanvas({ fill: "#3b3b5c", alpha: 0.3 }).addTo(map);
+const routeLayer = L.featureGroup().addTo(map); // featureGroup for .getBounds()
+let markerA = null, markerB = null;
+
+// ---------- Time controls ----------
+const dt = document.getElementById("dt");
+const hour = document.getElementById("hour");
+const hourLbl = document.getElementById("hourLbl");
+const alpha = document.getElementById("alpha");
+const alphaLbl = document.getElementById("alphaLbl");
+
+function setNow() {
+  const n = new Date();
+  const iso = new Date(n.getTime() - n.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  dt.value = iso;
+  syncHourFromDt();
+}
+function syncHourFromDt() {
+  const d = new Date(dt.value);
+  hour.value = d.getHours()*60 + d.getMinutes();
+  updateHourLabel();
+}
+function updateHourLabel() {
+  const m = +hour.value; const h = Math.floor(m/60), mm = m%60;
+  hourLbl.textContent = String(h).padStart(2,"0")+":"+String(mm).padStart(2,"0");
+}
+function updateAlphaLabel() {
+  const a = +alpha.value;
+  const how = a === 0 ? "ignore shade (shortest)" : a < 0.7 ? "slight" : a < 1.8 ? "balanced" : a < 3 ? "strong" : "shade at almost any cost";
+  alphaLbl.textContent = `${a.toFixed(1)} — ${how}`;
+}
+function currentDate() { return new Date(dt.value); }
+
+document.getElementById("nowBtn").onclick = setNow;
+// Redraw shadows on a time change, but only if any are on screen, and coalesced — the hour
+// slider fires continuously while dragging and each redraw is a few thousand convex hulls.
+let redrawTimer = null;
+function redrawShadows() {
+  if (!G || !shadowLayer.count()) return;
+  clearTimeout(redrawTimer);
+  redrawTimer = setTimeout(() => {
+    const b = map.getBounds();
+    renderShadows([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], true);
+  }, 120);
+}
+dt.onchange = () => { syncHourFromDt(); redrawShadows(); };
+hour.oninput = () => {
+  updateHourLabel();
+  const d = new Date(dt.value);
+  d.setHours(Math.floor(hour.value/60), hour.value%60, 0, 0);
+  dt.value = new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  redrawShadows();
+};
+alpha.oninput = updateAlphaLabel;
+
+// ---------- Geometry helpers ----------
+// Convex hull (monotone chain) over [lng,lat] points. Replaces turf.convex: the shadow pass
+// runs over thousands of footprints per query and the GeoJSON object churn dominated it.
+function convexHull(pts) {
+  if (pts.length < 3) return null;
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]);
+  const half = (src) => {
+    const h = [];
+    for (const q of src) {
+      while (h.length >= 2 && cross(h[h.length-2], h[h.length-1], q) <= 0) h.pop();
+      h.push(q);
+    }
+    h.pop();
+    return h;
+  };
+  const hull = half(p).concat(half(p.reverse()));
+  return hull.length >= 3 ? hull : null;
+}
+
+// Ray casting. Ring is an open array of [lng,lat] (no repeated last vertex).
+function pointInRing(c, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if ((yi > c[1]) !== (yj > c[1]) && c[0] < (xj - xi) * (c[1] - yi) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function ringBbox(ring) {
+  let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+  for (const [x, y] of ring) {
+    if (x < w) w = x; if (x > e) e = x;
+    if (y < s) s = y; if (y > n) n = y;
+  }
+  return [w, s, e, n];
+}
+
+// Shadow polygon: translate footprint away from the sun by h/tan(alt), hull of the union.
+function shadowPolygon(ring, height, sunAltRad, sunAzRad) {
+  if (sunAltRad <= 0.03) return null; // sun at/below horizon → handled as global night
+  let L = height / Math.tan(sunAltRad);       // metres
+  L = Math.min(Math.max(L, 0.1), 400);         // upper clamp only matters at low sun; lower is a degeneracy guard
+  const bearing = ((sunAzRad*180/Math.PI) % 360 + 360) % 360; // shadow bearing from north
+  const pts = ring.slice();
+  for (const c of ring) pts.push(offsetCoord(c, L, bearing));
+  const hull = convexHull(pts);
+  if (!hull) return null;
+  hull.bbox = ringBbox(hull);
+  return hull;
+}
+
+// Metres between two [lng,lat] coords — cheap equirectangular approximation, fine at city scale.
+function metres(c1, c2) {
+  const R = 6371000, toRad = Math.PI/180;
+  const x = (c2[0]-c1[0]) * toRad * Math.cos((c1[1]+c2[1])/2 * toRad);
+  const y = (c2[1]-c1[1]) * toRad;
+  return Math.sqrt(x*x + y*y) * R;
+}
+function bearingOf(c1, c2) {
+  const toRad = Math.PI/180, toDeg = 180/Math.PI;
+  const y = Math.sin((c2[0]-c1[0])*toRad) * Math.cos(c2[1]*toRad);
+  const x = Math.cos(c1[1]*toRad)*Math.sin(c2[1]*toRad) - Math.sin(c1[1]*toRad)*Math.cos(c2[1]*toRad)*Math.cos((c2[0]-c1[0])*toRad);
+  return (Math.atan2(y, x)*toDeg + 360) % 360;
+}
+// Move a coord `d` metres along `brg` degrees.
+function offsetCoord(c, d, brg) {
+  const toRad = Math.PI/180, R = 6371000;
+  const dx = d * Math.sin(brg*toRad), dy = d * Math.cos(brg*toRad);
+  return [ c[0] + (dx/R) * (180/Math.PI) / Math.cos(c[1]*toRad), c[1] + (dy/R) * (180/Math.PI) ];
+}
+// Circular mean of bearings, so a node between two segments offsets along the corner bisector.
+function meanBearing(bs) {
+  const toRad = Math.PI/180;
+  let x = 0, y = 0;
+  for (const b of bs) { x += Math.cos(b*toRad); y += Math.sin(b*toRad); }
+  return (Math.atan2(y, x)*180/Math.PI + 360) % 360;
+}
+
+// ---------- Shade lookup (grid-indexed) ----------
+// Point-in-polygon over every building+shadow was O(n) per sample; the graph needs tens of
+// thousands of samples, so bucket polygons into a uniform grid and only test the local cell.
+const CELL = 0.0012; // ~100 m
+function buildShadeIndex(polys) {
+  const grid = new Map();
+  for (const p of polys) {
+    if (!p || !p.bbox) continue;
+    const [w,s,e,n] = p.bbox;
+    for (let gx = Math.floor(w/CELL); gx <= Math.floor(e/CELL); gx++)
+      for (let gy = Math.floor(s/CELL); gy <= Math.floor(n/CELL); gy++) {
+        const k = gx + ":" + gy;
+        let cell = grid.get(k); if (!cell) grid.set(k, cell = []);
+        cell.push(p);
+      }
+  }
+  return grid;
+}
+function shadeIndexQuery(grid, coord) {
+  return grid.get(Math.floor(coord[0]/CELL) + ":" + Math.floor(coord[1]/CELL)) || [];
+}
+function pointInBbox(coord, bbox) {
+  return bbox && coord[0] >= bbox[0] && coord[1] >= bbox[1] && coord[0] <= bbox[2] && coord[1] <= bbox[3];
+}
+function isShaded(coord, sunAltRad) {
+  if (sunAltRad <= 0.03) return true; // night — everything shaded
+  for (const poly of shadeIndexQuery(shadeIndex, coord))
+    if (pointInBbox(coord, poly.bbox) && pointInRing(coord, poly)) return true;
+  return false;
+}
+
+// ---------- Artifact ----------
+// Everything below used to be fetched from Overpass and rebuilt on every query. It is now a
+// single precomputed static file (see build/): the sidewalk graph with its fragmentation already
+// repaired, plus Catastro building prisms. Fetched once, then cached by the browser.
+const ARTIFACT_URL = "data/valencia.json.gz";
+
+let G = null;                // decoded graph + buildings
+let shadeIndex = new Map();  // grid over buildings ∪ shadows, rebuilt per (time, area)
+let shadeKey = "";           // the sun position shadeIndex was built for
+let shadeBbox = null;        // the area it covers
+let lastShadows = null;
+
+async function loadArtifact() {
+  setStatus("Loading Valencia map data…");
+  const res = await fetch(ARTIFACT_URL);
+  if (!res.ok) throw new Error(`artifact ${res.status} — run \`make -C build\` first`);
+  // Whether we have to gunzip depends on the host, so sniff rather than assume. A plain static
+  // server (python3 -m http.server) hands over the raw gzip bytes; a CDN that sets
+  // Content-Encoding: gzip has already had the browser inflate them, and decompressing again
+  // would fail. The gzip magic number settles it either way.
+  const buf = new Uint8Array(await res.arrayBuffer());
+  let text;
+  if (buf[0] === 0x1f && buf[1] === 0x8b) {
+    const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"));
+    text = await new Response(stream).text();
+  } else {
+    text = new TextDecoder().decode(buf);
+  }
+  const a = JSON.parse(text);
+  const Q = a.meta.quant;
+
+  // Node coords: delta-decoded into flat typed arrays.
+  const n = a.meta.counts.nodes;
+  const lon = new Float64Array(n), lat = new Float64Array(n);
+  let px = 0, py = 0;
+  for (let i = 0; i < n; i++) {
+    px += a.nodes[2*i]; py += a.nodes[2*i+1];
+    lon[i] = px / Q; lat[i] = py / Q;
+  }
+
+  // Edges: delta-decoded, then packed into CSR so the hot Dijkstra loop walks contiguous memory.
+  const m = a.meta.counts.edges;
+  const ef = new Int32Array(m), et = new Int32Array(m);
+  const elen = new Float32Array(m), ecross = new Uint8Array(m);
+  let f = 0;
+  for (let i = 0; i < m; i++) {
+    f += a.eFrom[i];
+    ef[i] = f; et[i] = f + a.eTo[i];
+    elen[i] = a.eLen[i] / 10;
+    ecross[i] = a.eCross[i];
+  }
+  const deg = new Int32Array(n + 1);
+  for (let i = 0; i < m; i++) { deg[ef[i]]++; deg[et[i]]++; }
+  const head = new Int32Array(n + 1);
+  for (let i = 0; i < n; i++) head[i+1] = head[i] + deg[i];
+  const fill = head.slice(0, n);
+  const adjTo = new Int32Array(2*m), adjLen = new Float32Array(2*m);
+  const adjPen = new Float32Array(2*m), adjEdge = new Int32Array(2*m);
+  const CROSS = a.meta.crossPenaltyM ?? 18;
+  for (let i = 0; i < m; i++) {
+    const pen = ecross[i] ? CROSS : 0;
+    let k = fill[ef[i]]++; adjTo[k] = et[i]; adjLen[k] = elen[i]; adjPen[k] = pen; adjEdge[k] = i;
+    k = fill[et[i]]++;     adjTo[k] = ef[i]; adjLen[k] = elen[i]; adjPen[k] = pen; adjEdge[k] = i;
+  }
+
+  // Buildings: delta-decoded rings + height in metres.
+  const rings = [], heights = a.bHeights;
+  for (const flat of a.bRings) {
+    const ring = [];
+    let x = flat[0], y = flat[1];
+    ring.push([x/Q, y/Q]);
+    for (let i = 2; i < flat.length; i += 2) { x += flat[i]; y += flat[i+1]; ring.push([x/Q, y/Q]); }
+    ring.bbox = ringBbox(ring);
+    rings.push(ring);
+  }
+
+  // Spatial indexes: nodes for snapping, buildings for the shadow pass.
+  const nodeGrid = new Map();
+  for (let i = 0; i < n; i++) {
+    const k = Math.floor(lon[i]/CELL) + ":" + Math.floor(lat[i]/CELL);
+    let c = nodeGrid.get(k); if (!c) nodeGrid.set(k, c = []);
+    c.push(i);
+  }
+  const bldGrid = new Map();
+  rings.forEach((r, i) => {
+    const [w,s,e,nn] = r.bbox;
+    for (let gx = Math.floor(w/CELL); gx <= Math.floor(e/CELL); gx++)
+      for (let gy = Math.floor(s/CELL); gy <= Math.floor(nn/CELL); gy++) {
+        const k = gx + ":" + gy;
+        let c = bldGrid.get(k); if (!c) bldGrid.set(k, c = []);
+        c.push(i);
+      }
+  });
+
+  G = { meta: a.meta, n, m, lon, lat, head, adjTo, adjLen, adjPen, adjEdge,
+        rings, heights, nodeGrid, bldGrid,
+        sun: new Float32Array(m), sunKey: "", sunDone: new Uint8Array(m) };
+  return G;
+}
+
+const coordOf = (i) => [G.lon[i], G.lat[i]];
+
+// Buildings whose bbox falls in an area, via the grid.
+function buildingsIn(bbox) { // [w,s,e,n]
+  const [w,s,e,n] = bbox, seen = new Set();
+  for (let gx = Math.floor(w/CELL); gx <= Math.floor(e/CELL); gx++)
+    for (let gy = Math.floor(s/CELL); gy <= Math.floor(n/CELL); gy++)
+      for (const i of (G.bldGrid.get(gx + ":" + gy) || [])) seen.add(i);
+  return [...seen];
+}
+
+// Shadows are only ever needed where we are looking or routing, so this runs over an area
+// rather than the whole city — 197k parts city-wide, a few thousand in a corridor.
+const bboxCovers = (o, i) => o[0] <= i[0] && o[1] <= i[1] && o[2] >= i[2] && o[3] >= i[3];
+
+function computeShade(bbox, sun, timeKey) {
+  // Reuse whenever the sun has not moved and we already cover the area — panning inside the
+  // computed region must not trigger another pass over tens of thousands of footprints.
+  if (shadeKey === timeKey && shadeBbox && bboxCovers(shadeBbox, bbox)) return;
+  const polys = [];
+  for (const i of buildingsIn(bbox)) {
+    const ring = G.rings[i];
+    polys.push(ring);
+    const sh = shadowPolygon(ring, G.heights[i], sun.altitude, sun.azimuth);
+    if (sh) { sh.isShadow = true; polys.push(sh); }
+  }
+  lastShadows = polys;
+  shadeIndex = buildShadeIndex(polys);
+  shadeBbox = bbox;
+  shadeKey = timeKey;
+  // Edge sun values are only valid for one sun position.
+  if (G.sunKey !== timeKey) { G.sunDone.fill(0); G.sunKey = timeKey; }
+}
+
+// ---------- Dijkstra ----------
+class MinHeap {
+  constructor() { this.a = []; }
+  get size() { return this.a.length; }
+  push(item) {
+    const a = this.a; a.push(item);
+    let i = a.length-1;
+    while (i > 0) { const p = (i-1) >> 1; if (a[p][0] <= a[i][0]) break; [a[p], a[i]] = [a[i], a[p]]; i = p; }
+  }
+  pop() {
+    const a = this.a, top = a[0], last = a.pop();
+    if (a.length) {
+      a[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2*i+1, r = l+1; let m = i;
+        if (l < a.length && a[l][0] < a[m][0]) m = l;
+        if (r < a.length && a[r][0] < a[m][0]) m = r;
+        if (m === i) break;
+        [a[m], a[i]] = [a[i], a[m]]; i = m;
+      }
+    }
+    return top;
+  }
+}
+
+// Fraction of an edge that is in the sun (0 = fully shaded, 1 = fully exposed).
+// Evaluated lazily and memoised per sun position: Dijkstra only ever explores a corridor between
+// A and B, so a few thousand edges get sampled instead of the city's 437k.
+function edgeSun(ei, u, v, sunAlt) {
+  if (G.sunDone[ei]) return G.sun[ei];
+  const c1 = coordOf(u), c2 = coordOf(v);
+  let lit = 0;
+  for (let k = 1; k <= SAMPLES_PER_EDGE; k++) {
+    const t = k / (SAMPLES_PER_EDGE + 1);
+    if (!isShaded([c1[0] + (c2[0]-c1[0])*t, c1[1] + (c2[1]-c1[1])*t], sunAlt)) lit++;
+  }
+  const s = lit / SAMPLES_PER_EDGE;
+  G.sun[ei] = s; G.sunDone[ei] = 1;
+  return s;
+}
+
+// weight = (length + crossing penalty) × (1 + alpha × sun exposure).
+// alpha is the detour the walker will accept to stay in shade: at alpha=1 a fully sunny metre
+// costs the same as two shaded ones.
+//
+// A*, not plain Dijkstra. Every edge costs at least its own length, so straight-line distance to
+// the target never overestimates the remaining cost — the heuristic is admissible and the result
+// is still the exact optimum, but a cross-city route stops expanding half of Valencia to find it.
+function dijkstra(src, dst, a, sunAlt) {
+  const n = G.n;
+  const dist = new Float64Array(n).fill(Infinity);
+  const prev = new Int32Array(n).fill(-1);
+  const prevEdge = new Int32Array(n).fill(-1);
+  const done = new Uint8Array(n);
+  const tx = G.lon[dst], ty = G.lat[dst];
+  const kx = Math.cos(ty * Math.PI/180) * 111320, ky = 110540;
+  const h = (v) => Math.hypot((G.lon[v]-tx)*kx, (G.lat[v]-ty)*ky);
+
+  dist[src] = 0;
+  let settled = 0;
+  const heap = new MinHeap();
+  heap.push([h(src), src]);
+  while (heap.size) {
+    const [, u] = heap.pop();
+    if (done[u]) continue;
+    done[u] = 1; settled++;
+    if (u === dst) break;
+    const g = dist[u];
+    for (let k = G.head[u]; k < G.head[u+1]; k++) {
+      const v = G.adjTo[k];
+      if (done[v]) continue;
+      const sun = a === 0 ? 0 : edgeSun(G.adjEdge[k], u, v, sunAlt);
+      const ng = g + (G.adjLen[k] + G.adjPen[k]) * (1 + a * sun);
+      if (ng < dist[v]) { dist[v] = ng; prev[v] = u; prevEdge[v] = k; heap.push([ng + h(v), v]); }
+    }
+  }
+  if (dist[dst] === Infinity) return null;
+
+  const path = [];
+  for (let v = dst; v !== -1; v = prev[v]) path.push(v);
+  path.reverse();
+
+  // Score the chosen path against real sun values even when alpha was 0 (the shortest route
+  // still needs an honest shade percentage to compare against).
+  let length = 0, sunLen = 0;
+  const segs = [];
+  for (let i = 1; i < path.length; i++) {
+    const k = prevEdge[path[i]];
+    const len = G.adjLen[k];
+    const sun = edgeSun(G.adjEdge[k], path[i-1], path[i], sunAlt);
+    length += len; sunLen += len * sun;
+    segs.push({ from: path[i-1], to: path[i], sun });
+  }
+  return { path, segs, length, settled, shadePct: length ? 1 - sunLen/length : 1 };
+}
+
+// Nearest graph node, via the grid. Every node in the artifact is on the largest connected
+// component, so anything we snap to is reachable — the old version could land on an isolated
+// two-node stub and report "no route".
+function nearestNode(latlng) {
+  const c = [latlng.lng, latlng.lat];
+  let best = -1, bestD = Infinity;
+  for (let ring = 0; ring <= 12 && best < 0; ring++) {
+    const gx = Math.floor(c[0]/CELL), gy = Math.floor(c[1]/CELL);
+    for (let dx = -ring; dx <= ring; dx++) for (let dy = -ring; dy <= ring; dy++) {
+      if (ring > 0 && Math.abs(dx) !== ring && Math.abs(dy) !== ring) continue; // shell only
+      for (const i of (G.nodeGrid.get((gx+dx) + ":" + (gy+dy)) || [])) {
+        const d = metres(c, coordOf(i));
+        if (d < bestD) { bestD = d; best = i; }
+      }
+    }
+  }
+  return best;
+}
+
+// ---------- Rendering ----------
+const bboxOf = (...lls) => {
+  const pad = 0.004; // ~450 m, room to detour around the direct line
+  const lats = lls.map(l => l.lat), lngs = lls.map(l => l.lng);
+  return [Math.min(...lngs)-pad, Math.min(...lats)-pad, Math.max(...lngs)+pad, Math.max(...lats)+pad];
+};
+
+// Computing shade and drawing it want different areas. The router needs shade across the whole
+// A–B corridor, which for a cross-city trip is ~60k building parts — but handing 60k polygons to
+// Leaflet costs seconds and draws mostly sub-pixel smudge. So: compute over the corridor, draw
+// only what is on screen, and only when zoomed in far enough for a shadow to be worth a pixel.
+// Low enough that a whole cross-town route still shows its shade; the per-polygon pixel-size
+// filter below is what actually keeps the count sane as you zoom out.
+const DRAW_MIN_ZOOM = 13;
+
+function renderShadows(bbox, draw) {
+  const sun = SunCalc.getPosition(currentDate(), ...VALENCIA);
+  computeShade(bbox, sun, dt.value);
+  if (draw) drawShadows(sun);
+  return sun;
+}
+
+function drawShadows(sun) {
+  sun = sun || SunCalc.getPosition(currentDate(), ...VALENCIA);
+  if (sun.altitude <= 0.03 || !lastShadows || map.getZoom() < DRAW_MIN_ZOOM) {
+    shadowLayer.setPolys([]);
+    return;
+  }
+  const b = map.getBounds();
+  const [w, s, e, n] = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  // A shadow a couple of pixels across reads as noise but costs as much to draw as a big one,
+  // and a dense viewport holds tens of thousands of them. Drop anything under ~2 px.
+  const mPerPx = 156543.03 * Math.cos(VALENCIA[0] * Math.PI/180) / Math.pow(2, map.getZoom());
+  const minM = 2 * mPerPx;
+  const visible = [];
+  for (const poly of lastShadows) {
+    if (!poly.isShadow) continue;
+    const bb = poly.bbox;                       // cheap viewport reject
+    if (bb[2] < w || bb[0] > e || bb[3] < s || bb[1] > n) continue;
+    if ((bb[2]-bb[0]) * 85000 < minM && (bb[3]-bb[1]) * 111000 < minM) continue;
+    visible.push(poly);
+  }
+  shadowLayer.setPolys(visible);
+}
+
+function drawPath(result, color, weight, dash) {
+  for (const seg of result.segs) {
+    const c1 = coordOf(seg.from), c2 = coordOf(seg.to);
+    const lit = seg.sun > 0.5;
+    L.polyline([[c1[1],c1[0]],[c2[1],c2[0]]],
+      { color: dash ? color : (lit ? "#f4b400" : color), weight, opacity: dash ? 0.6 : 0.95, dashArray: dash }).addTo(routeLayer);
+  }
+}
+
+function card(title, r, best) {
+  const km = (r.length/1000).toFixed(2), min = Math.round(r.length/1.35/60), pct = Math.round(r.shadePct*100);
+  return `<div class="route-card ${best ? "best" : ""}">
+    <b>${title}</b> — ${pct}% in shade
+    <div style="color:#666">${km} km · ~${min} min walk</div>
+    <div class="bar"><i style="width:${pct}%"></i></div></div>`;
+}
+
+// ---------- Main flow ----------
+async function findRoute() {
+  if (!markerA || !markerB || !G) return;
+  setBusy(true); routeLayer.clearLayers(); document.getElementById("results").innerHTML = "";
+  try {
+    const a = markerA.getLatLng(), b = markerB.getLatLng();
+    setStatus("Computing shadows…");
+    await new Promise(r => setTimeout(r, 0));
+    const sun = renderShadows(bboxOf(a, b), false); // drawn below, once the map has settled
+
+    const src = nearestNode(a), dst = nearestNode(b);
+    if (src < 0 || dst < 0) throw new Error("That point is outside the Valencia map data");
+    setStatus("Routing…");
+    await new Promise(r => setTimeout(r, 0));
+
+    const shortest = dijkstra(src, dst, 0, sun.altitude);
+    const shady = dijkstra(src, dst, +alpha.value, sun.altitude);
+    if (!shortest || !shady) throw new Error("No route found — try points closer to a street");
+
+    const same = shady.length === shortest.length && Math.abs(shady.shadePct - shortest.shadePct) < 1e-9;
+    if (!same) drawPath(shortest, "#888", 4, "6 6");
+    drawPath(shady, "#2f8f4e", 6, null);
+
+    document.getElementById("results").innerHTML =
+      card("🌳 Shadiest", shady, true) + (same ? "" : card("Shortest", shortest, false));
+
+    map.fitBounds(routeLayer.getBounds(), { padding: [40,40] });
+    drawShadows(sun);
+    const extra = Math.round(shady.length - shortest.length);
+    setStatus(sun.altitude <= 0.03
+      ? "🌙 Sun is below the horizon — everything counts as shade."
+      : same
+      ? `The shortest route is already the shadiest — ${Math.round(shady.shadePct*100)}% shaded.`
+      : `Shadiest route is ${Math.round(shady.shadePct*100)}% shaded vs ${Math.round(shortest.shadePct*100)}% for the shortest, for ${extra} m extra.`);
+  } catch (e) {
+    setStatus("⚠️ " + e.message + ".");
+  } finally { setBusy(false); }
+}
+
+async function showShadowsOnly() {
+  if (!G) return;
+  setBusy(true);
+  try {
+    const bnds = map.getBounds();
+    setStatus("Computing shadows for this view…");
+    await new Promise(r => setTimeout(r, 0));
+    const sun = renderShadows([bnds.getWest(), bnds.getSouth(), bnds.getEast(), bnds.getNorth()], true);
+    setStatus(sun.altitude <= 0.03
+      ? "🌙 Sun is below the horizon at this time — everything counts as shade."
+      : `☀️ Sun altitude ${(sun.altitude*180/Math.PI).toFixed(0)}° — shadows drawn for this view.`);
+  } catch (e) { setStatus("⚠️ " + e.message); }
+  finally { setBusy(false); }
+}
+
+// ---------- UI plumbing ----------
+function setStatus(t) { document.getElementById("status").textContent = t; }
+function setBusy(b) { document.getElementById("findBtn").disabled = b || !(markerA && markerB); document.getElementById("shadeBtn").disabled = b; }
+
+function makeMarker(latlng, kind) {
+  const m = L.marker(latlng, { draggable: true, title: kind }).addTo(map);
+  m.bindTooltip(kind, { permanent: true, direction: "top", offset: [-15, -10] });
+  return m;
+}
+map.on("click", (e) => {
+  if (!markerA) markerA = makeMarker(e.latlng, "A");
+  else if (!markerB) markerB = makeMarker(e.latlng, "B");
+  else { markerA.setLatLng(e.latlng); if (markerB) map.removeLayer(markerB); markerB = null; }
+  setBusy(false);
+});
+document.getElementById("findBtn").onclick = findRoute;
+document.getElementById("shadeBtn").onclick = showShadowsOnly;
+
+// Keep the drawn shadows matched to what is on screen: panning into fresh territory needs new
+// shadow polygons, and zooming out past DRAW_MIN_ZOOM should drop them rather than draw mush.
+let moveTimer = null;
+map.on("moveend zoomend", () => {
+  if (!G || !shadowLayer.count()) return;
+  clearTimeout(moveTimer);
+  moveTimer = setTimeout(() => {
+    const b = map.getBounds();
+    renderShadows([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], true);
+  }, 200);
+});
+
+setNow();
+updateAlphaLabel();
+
+// Load the precomputed city once, up front. Everything after this is local computation.
+setBusy(true);
+loadArtifact().then((g) => {
+  const c = g.meta.counts;
+  setStatus(`Ready — ${c.nodes.toLocaleString()} sidewalk nodes, ` +
+            `${c.buildings.toLocaleString()} building parts (${g.meta.city}, ${g.meta.generated}). ` +
+            `Click the map to place A and B.`);
+  setBusy(false);
+}).catch((e) => {
+  setStatus("⚠️ Could not load map data: " + e.message);
+  setBusy(false);
+});
+</script>
+</body>
+</html>

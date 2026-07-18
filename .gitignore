@@ -1,0 +1,7 @@
+# Build inputs and outputs: large, regenerable, re-downloadable.
+# Recreate with `make -C build` — see build/Makefile.
+data/
+dist/
+build/node_modules/
+build/.wrangler/
+.DS_Store

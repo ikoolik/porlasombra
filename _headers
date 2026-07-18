@@ -1,0 +1,18 @@
+# Cloudflare Pages header rules.
+#
+# The artifact is the whole city and changes only when the build is rerun (quarterly-ish), so it
+# is worth caching hard. The page itself must not be, or a redeploy would not reach anyone.
+#
+# No Content-Encoding is declared for the .gz: Pages serves it as opaque bytes and the app
+# gunzips it itself. The loader sniffs the gzip magic number, so it also works if a host does
+# decide to decode it in transit.
+
+/data/*
+  Cache-Control: public, max-age=86400
+  Content-Type: application/gzip
+
+/
+  Cache-Control: public, max-age=300
+
+/index.html
+  Cache-Control: public, max-age=300
