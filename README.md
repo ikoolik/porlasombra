@@ -30,8 +30,8 @@ Nothing is computed on a server. There is no server.
 Build (occasional)                          Browser (every query)
 ──────────────────                          ─────────────────────
 Catastro buildingpart.gml ─┐
-                           ├─→ 5.5 MB  ──→  load once, decode
-OSM extract ─ osmium ──────┘   artifact      ↓
+OSM extract ─ osmium ──────┼─→ 6.0 MB  ──→  load once, decode
+Municipal tree inventory ──┘   artifact      ↓
                                             shadows for the corridor
                                              ↓
                                             A* ×2, lazy sun sampling
@@ -39,7 +39,7 @@ OSM extract ─ osmium ──────┘   artifact      ↓
                                             draw
 ```
 
-The whole city — 277,651 sidewalk nodes, 436,804 edges and 196,676 building parts — is baked offline into one 5.5 MB gzipped file. The browser fetches it once and does everything else locally: no API keys, no routing service, no per-request cost. Hosting is a static file on a CDN.
+The whole city — 277,651 sidewalk nodes, 436,804 edges, 196,676 building parts and 144,592 street trees — is baked offline into one 6.0 MB gzipped file. The browser fetches it once and does everything else locally: no API keys, no routing service, no per-request cost. Hosting is a static file on a CDN.
 
 ### Why the build step exists
 
@@ -78,6 +78,7 @@ Then open `http://localhost:8000` — the app expects `data/valencia.json.gz` to
 |---|---|---|
 | Building footprints **and heights** | [Spanish Cadastre](https://www.catastro.hacienda.gob.es/webinspire/index_eng.html) (INSPIRE `buildingpart`) | Free reuse, attribution to Dirección General del Catastro |
 | Walkable street network | OpenStreetMap via [Geofabrik](https://download.geofabrik.de/) | ODbL |
+| Street tree inventory | [Ajuntament de València](https://geoportal.valencia.es/) — Servicio de Parques y Jardines | CC BY 4.0 |
 | Sun position | [SunCalc](https://github.com/mourner/suncalc) 1.9.0 | BSD-2-Clause |
 | Map tiles | OpenStreetMap | [Tile usage policy](https://operations.osmfoundation.org/policies/tiles/) |
 
@@ -85,11 +86,15 @@ Then open `http://localhost:8000` — the app expects `data/valencia.json.gz` to
 
 Why the Cadastre rather than OSM heights? Measured across central Valencia, 8 of 5,978 OSM buildings carried an explicit `height` tag and 44% had `building:levels` — leaving **56% of the city casting a shadow computed from a guess**. The Cadastre has floor counts for 99.8% of 214,368 parts.
 
+The tree inventory is the same problem one step worse: it carries no height or crown field at all, so crown dimensions come from a species lookup (`build/lib/species.mjs`). That table covers 80% of trees by species and falls back to four `grupo` classes for the tail. Why the municipal set rather than OSM's 65,777 trees — OSM tags `height` on 0.6% of them, and that minority is a biased sample of protected monumental specimens.
+
+**The canopy is in the artifact but not yet used** — neither routing nor rendering consults it. It ships ahead of its consumers so both can be built against real data independently.
+
 ## Known limitations
 
 - Shadows are flat convex hulls, not a 3D raytrace: no roof shapes, no terrain, no shadow interaction.
 - Height is floors × 3 m. The Cadastre publishes no true above-ground height in metres, so this is better *coverage*, not better precision.
-- No **tree canopy** — a significant shade source in Valencia.
+- No **tree canopy** in the shade model yet — the data is baked in, but nothing reads it.
 - One sun position for the whole view (fine at city scale).
 - Pavement offsets are synthesised from road width, not surveyed sidewalk geometry.
 - **Valencia only.** Anywhere outside the precomputed bounding box has no data.

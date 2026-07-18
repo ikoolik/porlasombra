@@ -13,6 +13,7 @@ CATZIP  := $(DATA)/catastro-46900.zip
 GML     := $(DATA)/A.ES.SDGC.BU.46900.buildingpart.gml
 OPL     := $(DATA)/walkable.opl
 BLD     := $(DATA)/buildings.json
+TREES   := $(DATA)/trees.json
 OUT     := $(DATA)/valencia.json.gz
 
 WALKABLE := footway,path,steps,pedestrian,cycleway,track,living_street,corridor,\
@@ -45,8 +46,15 @@ $(GML): $(CATZIP)
 $(BLD): $(GML) parse-catastro.mjs lib/geo.mjs
 	node parse-catastro.mjs $(GML) $@
 
+# --- trees: Valencia municipal inventory (ArcGIS REST, CC BY 4.0) ---
+# 80 pages of 2,000 over one endpoint, ~2 min. Refreshed annually upstream, so this is the
+# slowest-moving of the three sources; delete the file to force a re-pull.
+$(TREES): fetch-trees.mjs | $(DATA)
+	node fetch-trees.mjs $@
+
 # --- artifact ---
-$(OUT): $(OPL) $(BLD) build.mjs build-graph.mjs parse-osm.mjs lib/geo.mjs
+$(OUT): $(OPL) $(BLD) $(TREES) build.mjs build-graph.mjs parse-osm.mjs parse-trees.mjs \
+        lib/geo.mjs lib/species.mjs
 	node --max-old-space-size=8192 build.mjs
 
 # --- publish ---

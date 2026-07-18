@@ -2,6 +2,7 @@
 //
 //   Catastro buildingpart.gml  ->  building prisms (ring + height)
 //   osmium OPL of walkable ways ->  sidewalk graph (L/R pavements, penalised crossings)
+//   Valencia tree inventory     ->  canopy points (position + species index)
 //
 // Output is a single static file the browser fetches once. No Overpass at query time, no
 // graph construction at query time, and no routing server anywhere.
@@ -10,6 +11,7 @@ import zlib from "node:zlib";
 import path from "node:path";
 import { parseOpl } from "./parse-osm.mjs";
 import { buildGraph, components, stitch, CROSS_PENALTY_M } from "./build-graph.mjs";
+import { buildCanopy } from "./parse-trees.mjs";
 
 const DATA = path.resolve(import.meta.dirname, "../data");
 const BBOX = [39.42, -0.42, 39.51, -0.32]; // s,w,n,e — Valencia city
@@ -124,6 +126,17 @@ for (const b of buildings) {
 }
 console.log(`  ${bRings.length} parts, ${vBefore} -> ${vAfter} vertices (${pct(vAfter, vBefore)})`);
 
+console.log("→ trees");
+const trees = JSON.parse(fs.readFileSync(path.join(DATA, "trees.json"), "utf8"));
+const canopy = buildCanopy(trees, BBOX, Q);
+{
+  const s = canopy.stats;
+  console.log(`  ${s.seen} inventory -> ${s.kept} in bbox ` +
+              `(${s.outside} outside, ${s.notATree} empty pits)`);
+  console.log(`  ${pct(s.bySpecies, s.kept)} dimensioned by species, ` +
+              `${pct(s.byGroup, s.kept)} by group fallback, ${s.rows} distinct crowns`);
+}
+
 const artifact = {
   meta: {
     city: "Valencia", bbox: BBOX, quant: Q,
@@ -131,9 +144,18 @@ const artifact = {
     sources: {
       buildings: "Catastro INSPIRE BU 46900 (buildingpart)",
       streets: "OpenStreetMap via Geofabrik",
+      trees: "Ajuntament de València, Servicio de Parques y Jardines (CC BY 4.0)",
     },
-    counts: { nodes: keptNodes.length, edges: eLen.length, buildings: bRings.length },
+    counts: {
+      nodes: keptNodes.length, edges: eLen.length,
+      buildings: bRings.length, trees: canopy.tSp.length,
+    },
     crossPenaltyM: CROSS_PENALTY_M,
+    // Crown dimension table, indexed by tSp: [height, crownDiameter, crownBase] in decimetres,
+    // then [tau, deciduous] as percent and 0/1. tauBare is the transmittance a deciduous crown
+    // falls back to once the leaves are off.
+    species: canopy.species,
+    tauBare: canopy.tauBare,
   },
   // Flat, quantised, delta-encoded arrays: JSON that gzips like a binary format.
   nodes: (() => {
@@ -149,6 +171,13 @@ const artifact = {
   eFrom, eTo, eLen, eCross,
   bRings,
   bHeights,
+  // Canopy. Positions delta-encoded like `nodes`; tSp indexes meta.species. Kept as its own
+  // column rather than merged into the building prisms: a crown floats (it shades the slab
+  // between crownBase and height, with open air beneath), and it is only opaque in leaf, so
+  // it cannot ride the same path as a solid ground-standing prism.
+  tLon: canopy.tLon,
+  tLat: canopy.tLat,
+  tSp: canopy.tSp,
 };
 
 const out = path.join(DATA, "valencia.json");
