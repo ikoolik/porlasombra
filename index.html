@@ -126,6 +126,23 @@
 const VALENCIA = [39.4699, -0.3763];
 const SAMPLES_PER_EDGE = 3;   // sun samples along each graph edge
 
+// Leaf-out window, as day-of-year. Half the canopy is deciduous, so a fixed crown would be
+// confidently wrong for a third of the year over half the trees: a Melia in January casts close
+// to nothing. Valencia is warm enough to leaf out in early April and hold until late November.
+// The ramps are three weeks at each end — not because the transition is really linear, but
+// because a hard cliff would make the shade jump on a single day of the date picker.
+const LEAF_ON = 100, LEAF_FULL = 121;    // ~10 Apr → ~1 May
+const LEAF_FADE = 316, LEAF_OFF = 337;   // ~12 Nov → ~3 Dec
+// How much light a bare deciduous crown still stops. Not none: trunk, branches and twigs go on
+// intercepting, which is why a winter plane avenue is not quite an open street.
+function leafFraction(date) {
+  const d = (date - new Date(date.getFullYear(), 0, 0)) / 86400000;
+  if (d <= LEAF_ON || d >= LEAF_OFF) return 0;
+  if (d >= LEAF_FULL && d <= LEAF_FADE) return 1;
+  return d < LEAF_FULL ? (d - LEAF_ON) / (LEAF_FULL - LEAF_ON)
+                       : (LEAF_OFF - d) / (LEAF_OFF - LEAF_FADE);
+}
+
 // The decoded artifact — graph, buildings, and the caches derived from them. Declared up here
 // rather than beside loadArtifact because the shadow layer is constructed before it: Leaflet can
 // fire the layer's first draw from a deferred invalidateSize, and `null` has to be a readable
@@ -134,13 +151,15 @@ let G = null;
 
 // ---------- Map ----------
 const map = L.map("map").setView(VALENCIA, 16);
-// Attribution covers all three uses, not just the tiles: the street network and the sidewalk
-// graph derived from it are OSM (ODbL requires crediting a derived database), and every building
-// footprint and height comes from the Spanish Cadastre.
+// Attribution covers every use, not just the tiles: the street network and the sidewalk graph
+// derived from it are OSM (ODbL requires crediting a derived database), every building footprint
+// and height comes from the Spanish Cadastre, and the canopy is the Ajuntament's tree inventory,
+// whose CC BY 4.0 makes this line an obligation rather than a courtesy.
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
   attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · ' +
-               'buildings © <a href="https://www.catastro.hacienda.gob.es/">Dirección General del Catastro</a>',
+               'buildings © <a href="https://www.catastro.hacienda.gob.es/">Dirección General del Catastro</a> · ' +
+               'trees © <a href="https://geoportal.valencia.es/">Ajuntament de València</a>',
 }).addTo(map);
 
 // ---------- Shadow rendering ----------
@@ -317,10 +336,53 @@ void main() {
 
 // Heights land in an 8-bit channel: 1 m quantisation over a 255 m range, which is finer than the
 // floor-count data behind it and avoids needing float-texture extensions at all.
+//
+// One texture carries both occluders, MAX-blended across all four channels:
+//   R  building height          — MAX is the taller of a tower and its podium
+//   G  canopy top               — MAX is the taller crown where two overlap
+//   B  255 − canopy base        — stored inverted so MAX yields the *lowest* base
+//   A  1 − transmittance        — stored inverted so MAX yields the *densest* crown
+//
+// Inverting B and A is what makes one blend equation serve four channels that want opposite
+// extremes. Where crowns overlap the result is their union slab at the densest tau, which
+// slightly overstates a palm crossing a broadleaf and is right everywhere else — street trees
+// overlap their own species far more often than another's.
+//
+// Buildings write alpha 0, deliberately: the alpha channel belongs to the canopy now, and a
+// building writing 1 would make its own roof read as an opaque crown.
 const RASTER_FS = `
 precision mediump float;
 varying float vH;
-void main() { gl_FragColor = vec4(clamp(vH / 255.0, 0.0, 1.0), 0.0, 0.0, 1.0); }`;
+void main() { gl_FragColor = vec4(clamp(vH / 255.0, 0.0, 1.0), 0.0, 0.0, 0.0); }`;
+
+// Canopy raster: one GL point per tree, sized to the crown. A crown needs no triangulation —
+// it is a disc — so 20k trees cost 20k vertices, against ~10 per building footprint.
+const CANOPY_VS = `
+attribute vec2 aPos;      // zoom-0 mercator offset from the city origin
+attribute vec4 aCrown;    // crown diameter (m), top (m), base (m), 1 - tau
+uniform float uScale;     // raster px per zoom-0 mercator unit
+uniform float uPxPerM;    // raster px per ground metre
+uniform vec2 uOrigin;
+uniform vec2 uSize;
+varying vec3 vC;
+void main() {
+  vec2 p = aPos * uScale + uOrigin;
+  gl_Position = vec4((p.x / uSize.x) * 2.0 - 1.0, 1.0 - (p.y / uSize.y) * 2.0, 0.0, 1.0);
+  // Clamped to the smallest size every implementation guarantees. A crown wide enough to hit
+  // that ceiling is ~30 m across at maximum zoom, which Valencia does not have.
+  gl_PointSize = clamp(aCrown.x * uPxPerM, 1.0, 255.0);
+  vC = aCrown.yzw;
+}`;
+
+const CANOPY_FS = `
+precision mediump float;
+varying vec3 vC;          // top, base, 1 - tau
+void main() {
+  // GL points rasterise as squares; a crown is a disc.
+  vec2 d = gl_PointCoord - vec2(0.5);
+  if (dot(d, d) > 0.25) discard;
+  gl_FragColor = vec4(0.0, vC.x / 255.0, (255.0 - vC.y) / 255.0, vC.z);
+}`;
 
 const MARCH_VS = `
 attribute vec2 aXY;
@@ -335,27 +397,45 @@ uniform float uCanvasH;
 uniform float uS2R;       // output px -> raster px
 uniform vec2 uStep;       // one march step, in raster px, pointing back toward the sun
 uniform float uRise;      // metres of ray height gained per step
-uniform float uMaxH;      // tallest building in the raster: past this nothing can block
+uniform float uStepM;     // metres of ground covered per step
+uniform float uMaxH;      // tallest occluder in the raster: past this nothing can block
 uniform int uSteps;
 uniform vec3 uColor;
 uniform float uAlpha;
 void main() {
   vec2 q = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) * uS2R + uPad;
   float rise = 0.0;
-  bool hit = false;
+  float T = 1.0;            // light still reaching the pixel along this ray
   for (int i = 0; i < ${MAX_MARCH_STEPS}; i++) {
     if (i >= uSteps) break;
     if (q.x < 0.0 || q.y < 0.0 || q.x >= uTexSize.x || q.y >= uTexSize.y) break;
     // The very first sample is the pixel itself, with rise 0 — that is what puts the building's
-    // own footprint in shade rather than only the ground beyond it.
-    float h = texture2D(uHeight, vec2(q.x / uTexSize.x, 1.0 - q.y / uTexSize.y)).r * 255.0;
-    if (h > rise) { hit = true; break; }
+    // own footprint in shade rather than only the ground beyond it. A crown does the opposite:
+    // at rise 0 the ray is still below the canopy base, so a tree does not shade its own trunk
+    // and its shadow correctly lands offset from it.
+    vec4 s = texture2D(uHeight, vec2(q.x / uTexSize.x, 1.0 - q.y / uTexSize.y));
+    if (s.r * 255.0 > rise) { T = 0.0; break; }     // a wall blocks or it does not
+    float top = s.g * 255.0;
+    if (top > 0.0) {
+      float base = 255.0 - s.b * 255.0;
+      if (rise > base && rise < top) {
+        // Beer-Lambert through the crown, not a flat multiply per step. tau is the light left
+        // after one crown's worth of foliage, so normalising the exponent by crown depth makes a
+        // full traverse cost exactly tau no matter how finely the ray happens to be stepped —
+        // otherwise the shade would darken every time the step size changed with zoom.
+        T *= pow(max(1.0 - s.a, 0.02), uStepM / max(top - base, 1.0));
+      }
+    }
     q += uStep;
     rise += uRise;
     if (rise > uMaxH) break;
   }
-  if (!hit) discard;
-  gl_FragColor = vec4(uColor * uAlpha, uAlpha);   // premultiplied; flat, never compounding
+  float shade = 1.0 - T;
+  if (shade < 0.02) discard;
+  // Buildings still come out at exactly uAlpha — shade is 1 whenever the ray hit a wall — so
+  // the only thing that varies is canopy, which is the one occluder that really is partial.
+  float al = uAlpha * shade;
+  gl_FragColor = vec4(uColor * al, al);           // premultiplied; never compounding
 }`;
 
 function glCompile(gl, type, src) {
@@ -381,7 +461,10 @@ function glProgram(gl, vs, fs) {
 
 const ShadowGL = L.Layer.extend({
   gpu: true,
-  initialize(opts) { this._opts = opts || {}; this._region = null; this._nVerts = 0; this._maxH = 0; },
+  initialize(opts) {
+    this._opts = opts || {};
+    this._region = null; this._nVerts = 0; this._nTrees = 0; this._maxH = 0; this._leaf = -1;
+  },
 
   onAdd(map) {
     this._map = map;
@@ -419,8 +502,10 @@ const ShadowGL = L.Layer.extend({
       this._maxOp = ext.MAX_EXT;
     }
     this._raster = glProgram(gl, RASTER_VS, RASTER_FS);
+    this._canopy = glProgram(gl, CANOPY_VS, CANOPY_FS);
     this._march = glProgram(gl, MARCH_VS, MARCH_FS);
     this._vbo = gl.createBuffer();
+    this._cvbo = gl.createBuffer();
     this._quad = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this._quad);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
@@ -456,7 +541,11 @@ const ShadowGL = L.Layer.extend({
     if (!G) return false;
     const b = this._map.getBounds();
     const view = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
-    if (this._region && bboxCovers(this._region, view)) return this._nVerts > 0;
+    // Crown transmittance depends on the date but not the time of day, so scrubbing the hour
+    // slider still touches no CPU — only moving the date picker across a leaf-out boundary does.
+    const leaf = leafFraction(currentDate());
+    if (this._region && bboxCovers(this._region, view) && this._leaf === leaf)
+      return this._nVerts > 0 || this._nTrees > 0;
     // Pad by the longest possible shadow (buildings off-screen still cast onto it) plus half a
     // screen, so a short pan does not trigger a rebuild.
     const padLat = MAX_SHADOW_M / 111000 + (view[3] - view[1]) * 0.5;
@@ -478,9 +567,31 @@ const ShadowGL = L.Layer.extend({
     gl.bindBuffer(gl.ARRAY_BUFFER, this._vbo);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
     this._nVerts = total / 3;
+
+    // Canopy: six floats a tree — position, then the crown the shader needs.
+    const tau = crownTau(currentDate());
+    const trees = treesIn(region);
+    const cd = new Float32Array(trees.length * 6);
+    let ci = 0;
+    for (const i of trees) {
+      const sp = G.species[G.tSp[i]], t = tau[G.tSp[i]];
+      if (t >= 0.96) continue;                 // see computeShade: too sheer to draw or to route on
+      cd[ci++] = MERC.x(G.tLon[i]) - MX0;
+      cd[ci++] = MERC.y(G.tLat[i]) - MY0;
+      cd[ci++] = sp.cd;
+      cd[ci++] = Math.min(sp.h, 255);
+      cd[ci++] = sp.cb;
+      cd[ci++] = 1 - t;
+      if (sp.h > maxH) maxH = sp.h;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._cvbo);
+    gl.bufferData(gl.ARRAY_BUFFER, cd.subarray(0, ci), gl.DYNAMIC_DRAW);
+    this._nTrees = ci / 6;
+
     this._maxH = Math.min(maxH, 255);
     this._region = region;
-    return this._nVerts > 0;
+    this._leaf = leaf;
+    return this._nVerts > 0 || this._nTrees > 0;
   },
 
   redraw() {
@@ -558,6 +669,25 @@ const ShadowGL = L.Layer.extend({
     gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 12, 0);
     gl.drawArrays(gl.TRIANGLES, 0, this._nVerts);
     gl.disableVertexAttribArray(aPos);
+
+    // Canopy into the same texture, same MAX blend, different channels.
+    if (this._nTrees) {
+      gl.useProgram(this._canopy.p);
+      gl.uniform1f(this._canopy.u.uScale, scale * s2r);
+      gl.uniform1f(this._canopy.u.uPxPerM, s2r / mPerPx);
+      gl.uniform2f(this._canopy.u.uOrigin, originX, originY);
+      gl.uniform2f(this._canopy.u.uSize, texW, texH);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._cvbo);
+      const cPos = gl.getAttribLocation(this._canopy.p, "aPos");
+      const cCrown = gl.getAttribLocation(this._canopy.p, "aCrown");
+      gl.enableVertexAttribArray(cPos);
+      gl.enableVertexAttribArray(cCrown);
+      gl.vertexAttribPointer(cPos, 2, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribPointer(cCrown, 4, gl.FLOAT, false, 24, 8);
+      gl.drawArrays(gl.POINTS, 0, this._nTrees);
+      gl.disableVertexAttribArray(cPos);
+      gl.disableVertexAttribArray(cCrown);
+    }
     gl.disable(gl.BLEND);
 
     // ---- Pass 2: march ----
@@ -580,6 +710,7 @@ const ShadowGL = L.Layer.extend({
     gl.uniform1f(this._march.u.uS2R, s2r / RS);
     gl.uniform2f(this._march.u.uStep, -Math.sin(br) * perPx, Math.cos(br) * perPx);  // toward the sun
     gl.uniform1f(this._march.u.uRise, stepM * Math.tan(sun.altitude));
+    gl.uniform1f(this._march.u.uStepM, stepM);
     gl.uniform1f(this._march.u.uMaxH, this._maxH);
     gl.uniform1i(this._march.u.uSteps, Math.min(MAX_MARCH_STEPS, Math.ceil(padM / stepM) + 2));
     gl.uniform3f(this._march.u.uColor, c[0], c[1], c[2]);
@@ -775,6 +906,48 @@ function shadowPolygon(ring, height, sunAltRad, sunAzRad) {
   return hull;
 }
 
+// Canopy shadow: an ellipse, not a hull.
+//
+// A crown is modelled as a sphere of diameter `cd` floating at the middle of the slab between
+// crownBase and height. The shadow a sphere casts on flat ground is an ellipse — the same width
+// as the crown across the sun, stretched by 1/sin(altitude) along it, and offset by
+// centreHeight/tan(altitude) in the shadow's direction. That is two numbers and a rotation,
+// where a building needs a projected hull, and it is the whole reason 144k trees stay tractable.
+//
+// The sphere is the approximation that matters. It suits a dome, flatters a columnar cypress and
+// is plainly wrong for a palm — but the palm's transmittance is doing the real work there, not
+// its outline.
+function canopyShadow(i, tau, sunAltRad, sunAzRad) {
+  if (sunAltRad <= 0.03) return null;
+  const sp = G.species[G.tSp[i]];
+  const hc = (sp.cb + sp.h) / 2;
+  const alt = Math.max(sunAltRad, 0.05);              // guard the 1/sin blow-up at sunrise
+  const along = Math.min(hc / Math.tan(alt), MAX_SHADOW_M);
+  const brg = ((sunAzRad * 180 / Math.PI) % 360 + 360) % 360;
+  const c = offsetCoord([G.tLon[i], G.tLat[i]], along, brg);
+  const b = sp.cd / 2;                                 // semi-axis across the sun
+  const aAx = Math.min(b / Math.sin(alt), MAX_SHADOW_M); // semi-axis along it
+  const br = brg * Math.PI / 180;
+  // Bounding box of the rotated ellipse, in degrees, for the grid index.
+  const ex = Math.hypot(aAx * Math.sin(br), b * Math.cos(br));
+  const ey = Math.hypot(aAx * Math.cos(br), b * Math.sin(br));
+  const dLng = 1 / (111320 * Math.cos(c[1] * Math.PI / 180)), dLat = 1 / 110540;
+  return {
+    c, a: aAx, b, tau,
+    sin: Math.sin(br), cos: Math.cos(br),
+    bbox: [c[0] - ex*dLng, c[1] - ey*dLat, c[0] + ex*dLng, c[1] + ey*dLat],
+  };
+}
+
+// Fraction of light a canopy ellipse lets through at a point — its tau inside, 1 outside.
+function canopyTransmit(el, coord) {
+  const mLng = 111320 * Math.cos(coord[1] * Math.PI / 180);
+  const dx = (coord[0] - el.c[0]) * mLng, dy = (coord[1] - el.c[1]) * 110540;
+  // Rotate into the ellipse's frame: `a` runs along the shadow bearing, `b` across it.
+  const u = dy * el.cos + dx * el.sin, v = dx * el.cos - dy * el.sin;
+  return (u*u) / (el.a*el.a) + (v*v) / (el.b*el.b) <= 1 ? el.tau : 1;
+}
+
 // Metres between two [lng,lat] coords — cheap equirectangular approximation, fine at city scale.
 function metres(c1, c2) {
   const R = 6371000, toRad = Math.PI/180;
@@ -833,6 +1006,26 @@ function isShaded(coord, sunAltRad) {
   return false;
 }
 
+// Fraction of direct sun reaching a point: 0 fully shaded, 1 fully exposed.
+//
+// Buildings stay binary — a wall blocks or it does not. Canopy does not: dappled shade is real,
+// pedestrians treat it as shade, and a palm is nearly transparent at a low sun. So the canopies
+// covering a point multiply their transmittances together, and a building short-circuits to 0.
+//
+// Binary would have been simpler, but its error is systematic rather than noise: it overstates
+// every crown by the same amount, which biases tree-lined streets against building-shaded ones —
+// and choosing between exactly those two is what this app does.
+function lightAt(coord, sunAltRad) {
+  if (isShaded(coord, sunAltRad)) return 0;
+  let t = 1;
+  for (const el of shadeIndexQuery(canopyIndex, coord)) {
+    if (!pointInBbox(coord, el.bbox)) continue;
+    t *= canopyTransmit(el, coord);
+    if (t < 0.01) return 0;                     // saturated; more crowns cannot change the route
+  }
+  return t;
+}
+
 // ---------- Artifact ----------
 // Everything below used to be fetched from Overpass and rebuilt on every query. It is now a
 // single precomputed static file (see build/): the sidewalk graph with its fragmentation already
@@ -840,9 +1033,11 @@ function isShaded(coord, sunAltRad) {
 const ARTIFACT_URL = "data/valencia.json.gz";
 
 let shadeIndex = new Map();  // grid over buildings ∪ shadows, rebuilt per (time, area)
+let canopyIndex = new Map(); // grid over canopy shadow ellipses, same lifetime
 let shadeKey = "";           // the sun position shadeIndex was built for
 let shadeBbox = null;        // the area it covers
 let lastShadows = null;
+let lastCanopy = null;
 
 async function loadArtifact() {
   setStatus("Loading Valencia map data…");
@@ -908,6 +1103,25 @@ async function loadArtifact() {
     rings.push(ring);
   }
 
+  // Canopy: delta-decoded positions plus an index into the crown table. The build step ships
+  // indices rather than dimensions per tree so that both consumers — the router's ellipse test
+  // and the renderer's raster — resolve from this one table. Two lookups of the same numbers
+  // cannot disagree; two copies of the table eventually would.
+  const tn = a.meta.counts.trees || 0;
+  const tLon = new Float64Array(tn), tLat = new Float64Array(tn);
+  const tSp = new Uint8Array(tn);
+  let tx = 0, ty = 0;
+  for (let i = 0; i < tn; i++) {
+    tx += a.tLon[i]; ty += a.tLat[i];
+    tLon[i] = tx / Q; tLat[i] = ty / Q; tSp[i] = a.tSp[i];
+  }
+  // Crown table, decoded out of the artifact's decimetres/percent into metres and fractions.
+  // Fields: height, crown diameter, crown base, transmittance in leaf, deciduous.
+  const species = (a.meta.species || []).map(([h, cd, cb, tau, dec]) => ({
+    h: h / 10, cd: cd / 10, cb: cb / 10, tau: tau / 100, dec: !!dec,
+  }));
+  const tauBare = (a.meta.tauBare ?? 78) / 100;
+
   // Spatial indexes: nodes for snapping, buildings for the shadow pass.
   const nodeGrid = new Map();
   for (let i = 0; i < n; i++) {
@@ -926,10 +1140,36 @@ async function loadArtifact() {
       }
   });
 
+  const treeGrid = new Map();
+  for (let i = 0; i < tn; i++) {
+    const k = Math.floor(tLon[i]/CELL) + ":" + Math.floor(tLat[i]/CELL);
+    let c = treeGrid.get(k); if (!c) treeGrid.set(k, c = []);
+    c.push(i);
+  }
+
   G = { meta: a.meta, n, m, lon, lat, head, adjTo, adjLen, adjPen, adjEdge,
         rings, heights, nodeGrid, bldGrid, tris: new Array(rings.length),
+        tn, tLon, tLat, tSp, species, tauBare, treeGrid,
         sun: new Float32Array(m), sunKey: "", sunDone: new Uint8Array(m) };
   return G;
+}
+
+// Trees whose position falls in an area, via the grid. A crown is a few metres across, so unlike
+// a building its own extent never spans a cell and the point alone indexes it.
+function treesIn(bbox) { // [w,s,e,n]
+  const [w,s,e,n] = bbox, out = [];
+  for (let gx = Math.floor(w/CELL); gx <= Math.floor(e/CELL); gx++)
+    for (let gy = Math.floor(s/CELL); gy <= Math.floor(n/CELL); gy++)
+      for (const i of (G.treeGrid.get(gx + ":" + gy) || []))
+        if (G.tLon[i] >= w && G.tLon[i] <= e && G.tLat[i] >= s && G.tLat[i] <= n) out.push(i);
+  return out;
+}
+
+// Per-species transmittance for a given date, resolved once and shared by both consumers.
+// Evergreens ignore the season; deciduous crowns fade between their leaf tau and the bare one.
+function crownTau(date) {
+  const leaf = leafFraction(date);
+  return G.species.map((s) => (s.dec ? s.tau * leaf + G.tauBare * (1 - leaf) : s.tau));
 }
 
 const coordOf = (i) => [G.lon[i], G.lat[i]];
@@ -960,6 +1200,20 @@ function computeShade(bbox, sun, timeKey) {
   }
   lastShadows = polys;
   shadeIndex = buildShadeIndex(polys);
+
+  // Canopy, over the same area and the same sun. Transmittance is resolved per species once
+  // here rather than per tree: 47 crowns against tens of thousands of trees.
+  const tau = crownTau(currentDate());
+  const canopies = [];
+  for (const i of treesIn(bbox)) {
+    const el = canopyShadow(i, tau[G.tSp[i]], sun.altitude, sun.azimuth);
+    // A crown that stops under 4% of the light cannot change a route and costs a test per
+    // sample to say so. Bare winter deciduous mostly lands here, which is the point.
+    if (el && el.tau < 0.96) canopies.push(el);
+  }
+  lastCanopy = canopies;
+  canopyIndex = buildShadeIndex(canopies);
+
   shadeBbox = bbox;
   shadeKey = timeKey;
   // Edge sun values are only valid for one sun position.
@@ -1001,7 +1255,7 @@ function edgeSun(ei, u, v, sunAlt) {
   let lit = 0;
   for (let k = 1; k <= SAMPLES_PER_EDGE; k++) {
     const t = k / (SAMPLES_PER_EDGE + 1);
-    if (!isShaded([c1[0] + (c2[0]-c1[0])*t, c1[1] + (c2[1]-c1[1])*t], sunAlt)) lit++;
+    lit += lightAt([c1[0] + (c2[0]-c1[0])*t, c1[1] + (c2[1]-c1[1])*t], sunAlt);
   }
   const s = lit / SAMPLES_PER_EDGE;
   G.sun[ei] = s; G.sunDone[ei] = 1;
@@ -1126,7 +1380,37 @@ function drawShadows(sun) {
     if ((bb[2]-bb[0]) * 85000 < minM && (bb[3]-bb[1]) * 111000 < minM) continue;
     visible.push(poly);
   }
+  // Canopy, but only the crowns that are nearly opaque anyway. This renderer fills every polygon
+  // at one flat tone — that is how it avoids compounding alpha — so it cannot say "a third of the
+  // light". Drawing a palm here would claim shade the router does not believe in, so the cutoff
+  // keeps the two consistent in the only way this path can be: dense crowns are shade, sheer ones
+  // are nothing. The GPU path, which is what nearly everyone gets, shades them properly.
+  const OPAQUE_ENOUGH = 0.35;
+  for (const el of lastCanopy || []) {
+    if (el.tau > OPAQUE_ENOUGH) continue;
+    const bb = el.bbox;
+    if (bb[2] < w || bb[0] > e || bb[3] < s || bb[1] > n) continue;
+    if ((bb[2]-bb[0]) * 85000 < minM && (bb[3]-bb[1]) * 111000 < minM) continue;
+    visible.push(ellipsePolygon(el));
+  }
   shadowLayer.setPolys(visible);
+}
+
+// An ellipse as a ring, for the 2D fallback. Sixteen points is under a pixel of chord error at
+// the zoom this path still draws at.
+function ellipsePolygon(el) {
+  const mLng = 111320 * Math.cos(el.c[1] * Math.PI / 180);
+  const ring = [];
+  for (let k = 0; k < 16; k++) {
+    const th = k / 16 * 2 * Math.PI;
+    const u = Math.cos(th) * el.a, v = Math.sin(th) * el.b;
+    // Back out of the ellipse frame: `a` runs along the shadow bearing, `b` across it.
+    ring.push([el.c[0] + (u * el.sin + v * el.cos) / mLng,
+               el.c[1] + (u * el.cos - v * el.sin) / 110540]);
+  }
+  ring.bbox = el.bbox;
+  ring.isShadow = true;
+  return ring;
 }
 
 function drawPath(result, color, weight, dash) {

@@ -10,7 +10,9 @@ In a Valencian July the sunny pavement and the shaded one are different weather.
 
 ## How it works
 
-Building shadows are computed from real footprints and heights, and the router searches a graph where every street has a **left and a right pavement** as separate places you can be. Crossing the road costs you, so it only happens when the shade is worth it.
+Shadows are computed from real building footprints and heights and from the city's **144,592 street trees**, and the router searches a graph where every street has a **left and a right pavement** as separate places you can be. Crossing the road costs you, so it only happens when the shade is worth it.
+
+Buildings block the sun outright; a canopy only filters it, so `sun_exposure` runs continuously from 0 to 1 rather than flipping between them. On a tree-lined Eixample route that is the difference between calling a street 47% shaded and 70%.
 
 Edge cost is:
 
@@ -62,7 +64,20 @@ Shade is a property of a *place*, not of a building, so it is computed per pixel
 
 Nothing is precomputed or shipped — the height field is rasterised on demand from the rings already in the artifact, at display resolution, so the shade is exactly as sharp as the screen at any zoom.
 
-Below the horizon there is nothing to march: the whole view fills at the same tone a building's shadow gets, because everywhere is shade and that is what the router already reports. Shade is binary, and night is shade.
+Below the horizon there is nothing to march: the whole view fills at the same tone a building's shadow gets, because everywhere is shade and that is what the router already reports. Night is shade.
+
+### Trees are not buildings
+
+A building is opaque and stands on the ground. A crown is neither, and both differences matter:
+
+- **It floats.** A height field says "the occluder reaches *h*", which is exact for a prism and wrong for a canopy with open air beneath it. Trees are stored as a slab — crown base to crown top — so a ray can pass under one. This is also why a tree does not shade its own trunk, and why its shadow correctly lands offset from it.
+- **It leaks.** Dappled shade is real and pedestrians treat it as shade. Each crown carries a transmittance, and the ray multiplies them as it goes rather than stopping at the first hit. Buildings still short-circuit to full shade, so they look exactly as they did.
+
+Binary would have been simpler, but its error is systematic rather than noise: it overstates every crown by the same amount, which biases tree-lined streets against building-shaded ones — and choosing between those two is the entire job.
+
+Both occluders share one texture, MAX-blended: building height in R, crown top in G, crown base in B, density in A. B and A are stored inverted so that a single blend equation yields the *lowest* base and the *densest* crown, which is what a union of overlapping canopies should be.
+
+Half the inventory is deciduous, so crowns fade to a bare-branch transmittance outside a leaf-out window — a `Melia` in January casts almost nothing. The window depends on the date but not the time of day, so scrubbing the hour slider still does no CPU work at all.
 
 The point is the cost model. The old renderer built a convex hull per building and filled a path per shadow, which cost tens of milliseconds for a dense viewport and forced a 120 ms debounce on the time slider and 200 ms on pan. Marching pixels costs the same whether the view holds 200 buildings or 20,000, so the debounces are gone: the shade tracks the map and the time slider at 60 fps.
 
@@ -103,14 +118,15 @@ Why the Cadastre rather than OSM heights? Measured across central Valencia, 8 of
 
 The tree inventory is the same problem one step worse: it carries no height or crown field at all, so crown dimensions come from a species lookup (`build/lib/species.mjs`). That table covers 80% of trees by species and falls back to four `grupo` classes for the tail. Why the municipal set rather than OSM's 65,777 trees — OSM tags `height` on 0.6% of them, and that minority is a biased sample of protected monumental specimens.
 
-**The canopy is in the artifact but not yet used** — neither routing nor rendering consults it. It ships ahead of its consumers so both can be built against real data independently.
-
 ## Known limitations
 
 - Buildings are flat-topped prisms, not a 3D model: no roof shapes, no terrain, no reflected light.
 - The drawn shade is a GPU ray march per pixel; the **routing** shade is still a point-in-polygon test against convex hulls of the projected footprints, which slightly over-covers concave buildings. The two agree on ~99.8% of pixels away from shadow edges.
+- Canopy is the same split one step wider: the renderer marches a ray through crown slabs, while the router tests the ellipse a spherical crown projects onto the ground. Both read the same crown table, so they cannot disagree about a *tree* — but they are two models of its shadow, and they drift at the edges more than the building pair does.
 - Height is floors × 3 m. The Cadastre publishes no true above-ground height in metres, so this is better *coverage*, not better precision.
-- No **tree canopy** in the shade model yet — the data is baked in, but nothing reads it.
+- **Crown dimensions are estimates, not measurements.** No source publishes them, so they come from a species table of typical mature Valencia street trees. That is the likeliest thing here to be visibly wrong, and it is a pure data change to correct.
+- Crowns are modelled as spheres — fine for a dome, flattering to a columnar cypress, and plainly wrong for a palm, where the transmittance rather than the outline is doing the work.
+- The 2D fallback cannot express partial shade at all, so it draws only crowns that are nearly opaque anyway and ignores sheer ones. The GPU path, which is what nearly everyone gets, shades them properly.
 - One sun position for the whole view (fine at city scale).
 - Pavement offsets are synthesised from road width, not surveyed sidewalk geometry.
 - **Valencia only.** Anywhere outside the precomputed bounding box has no data.
