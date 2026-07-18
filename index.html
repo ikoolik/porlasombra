@@ -48,6 +48,30 @@
   .steps { font-size: 12px; color: var(--muted); margin: 10px 0 0; padding-left: 16px; line-height: 1.5; }
   .badge { display: inline-block; width: 20px; height: 20px; border-radius: 50%; color:#fff; text-align:center; line-height:20px; font-size:12px; font-weight:700; }
   .badge.a { background:#2b6cb0; } .badge.b { background:#c53030; }
+  .badge.sm { width: 15px; height: 15px; line-height: 15px; font-size: 10px; vertical-align: -2px; margin-right: 5px; }
+
+  /* Geocoder. The suggestion list is absolutely positioned so it overlays what follows instead
+     of pushing the controls down — a panel that reflows on every keystroke is unusable. */
+  .geo { position: relative; }
+  .geo input { width: 100%; padding: 7px 26px 7px 8px; font-size: 13px; border: 1px solid #ddd; border-radius: 8px; }
+  .geo input:focus { outline: none; border-color: var(--accent); }
+  .geo .clear {
+    position: absolute; right: 4px; top: 4px; width: 22px; height: 22px; margin: 0; padding: 0;
+    border: none; border-radius: 6px; background: none; color: var(--muted);
+    font-size: 15px; line-height: 22px; cursor: pointer; display: none;
+  }
+  .geo.filled .clear { display: block; }
+  .geo .clear:hover { background: #f0f0f0; color: var(--ink); }
+  .sugg {
+    position: absolute; z-index: 1200; top: 100%; left: 0; right: 0; margin: 3px 0 0; padding: 4px;
+    list-style: none; background: #fff; border: 1px solid #ddd; border-radius: 9px;
+    box-shadow: 0 8px 22px rgba(0,0,0,.16); max-height: 232px; overflow-y: auto; display: none;
+  }
+  .sugg.open { display: block; }
+  .sugg li { padding: 6px 8px; border-radius: 6px; font-size: 13px; line-height: 1.35; cursor: pointer; }
+  .sugg li.sel { background: #f2fbf5; }
+  .sugg li .n { display: block; font-size: 11px; color: var(--muted); }
+  .sugg li.empty { color: var(--muted); cursor: default; }
   #results { margin-top: 12px; font-size: 13px; }
   .route-card { border:1px solid #eee; border-radius:9px; padding:8px 10px; margin-top:8px; }
   .route-card.best { border-color: var(--accent); background: #f2fbf5; }
@@ -86,6 +110,22 @@
   <div id="body">
   <p class="sub">Finds the <b>shadiest walking route</b> between two points in Valencia — including <b>which side of the street</b> to walk on. Building heights come from the <b>Spanish Cadastre</b>, streets from OpenStreetMap, and <b>street trees</b> from the Ajuntament de València's tree inventory — all baked into one precomputed file. Shadows and routing run <b>entirely in your browser</b>. No API keys, no server.</p>
 
+  <label for="fromQ"><span class="badge a sm">A</span>From</label>
+  <div class="geo" id="fromG">
+    <input id="fromQ" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
+           placeholder="Street and number, or click the map" />
+    <button class="clear" id="fromC" tabindex="-1" aria-label="Clear start">×</button>
+    <ul class="sugg" id="fromS" role="listbox"></ul>
+  </div>
+
+  <label for="toQ"><span class="badge b sm">B</span>To</label>
+  <div class="geo" id="toG">
+    <input id="toQ" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
+           placeholder="Street and number, or click the map" />
+    <button class="clear" id="toC" tabindex="-1" aria-label="Clear destination">×</button>
+    <ul class="sugg" id="toS" role="listbox"></ul>
+  </div>
+
   <label for="dt">Date & time</label>
   <div class="row">
     <input type="datetime-local" id="dt" />
@@ -99,7 +139,7 @@
   <input type="range" id="alpha" min="0" max="4" step="0.1" value="1.2" />
 
   <ol class="steps">
-    <li>Click the map to drop <span class="badge a">A</span> (start), then <span class="badge b">B</span> (end). Markers are draggable.</li>
+    <li>Search a street and number above, or click the map to drop <span class="badge a">A</span> (start) then <span class="badge b">B</span> (end). Markers are draggable.</li>
     <li>Press <b>Find shady route</b>.</li>
   </ol>
 
@@ -1130,6 +1170,8 @@ async function loadArtifact() {
   }));
   const tauBare = (a.meta.tauBare ?? 78) / 100;
 
+  const geo = buildGeo(a);
+
   // Spatial indexes: nodes for snapping, buildings for the shadow pass.
   const nodeGrid = new Map();
   for (let i = 0; i < n; i++) {
@@ -1157,9 +1199,129 @@ async function loadArtifact() {
 
   G = { meta: a.meta, n, m, lon, lat, head, adjTo, adjLen, adjPen, adjEdge,
         rings, heights, nodeGrid, bldGrid, tris: new Array(rings.length),
-        tn, tLon, tLat, tSp, species, tauBare, treeGrid,
+        tn, tLon, tLat, tSp, species, tauBare, treeGrid, geo,
         sun: new Float32Array(m), sunKey: "", sunDone: new Uint8Array(m) };
   return G;
+}
+
+// ---------- geocoder ----------
+// Streets and their house numbers, baked into the same artifact as everything else. 2.7k streets
+// is a short enough list to scan linearly per keystroke, so there is no index to build or keep in
+// sync — the arrays as shipped *are* the index.
+function buildGeo(a) {
+  const names = a.sName || [], alias = a.sAlias || [], counts = a.sCount || [], num = a.aNum || [];
+  const total = num.length;
+  const q = a.meta.quant;
+  const lon = new Float64Array(total), lat = new Float64Array(total);
+  let x = 0, y = 0;
+  for (let i = 0; i < total; i++) { x += a.aLon[i]; y += a.aLat[i]; lon[i] = x / q; lat[i] = y / q; }
+  // House numbers are grouped by street, so a street's block is [start, start + count).
+  const start = new Int32Array(names.length);
+  for (let i = 0, off = 0; i < names.length; i++) { start[i] = off; off += counts[i]; }
+  // One haystack per street: the display name plus the Catastro spelling where it differs, so
+  // "Eivissa" and "Ibiza" both land on the same street.
+  const norm = names.map((n, i) => normalizeQ(alias[i] ? n + " " + alias[i] : n).split(" "));
+  return { names, counts, start, num, lon, lat, norm };
+}
+
+// Fold accents and punctuation away: people type "xativa" for "Xàtiva" and "d Eivissa" for
+// "d'Eivissa", and neither should miss.
+function normalizeQ(s) {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+          .replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+const HOUSE_RE = /[\s,]+(\d+[a-zA-Z]?)\s*$/;
+
+// Returns up to `limit` places for a query like "xativa 12", "carrer de la pau" or "pau 3".
+function geoSearch(q, limit = 8) {
+  const geo = G && G.geo;
+  if (!geo || !geo.names.length) return [];
+  const raw = q.trim();
+  if (raw.length < 2) return [];
+
+  // A trailing number is a house number, not part of the street name — except where the street
+  // *is* a number, which is why the street match is retried on the whole string if this fails.
+  const h = HOUSE_RE.exec(raw);
+  const wanted = h ? h[1].toLowerCase() : null;
+  let hits = matchStreets(geo, h ? raw.slice(0, h.index) : raw);
+  if (!hits.length && wanted) hits = matchStreets(geo, raw);
+
+  const out = [];
+  if (wanted) {
+    // Exact number first, then the ones being typed towards, so "1" still offers 1 before 10.
+    for (const pass of [0, 1]) {
+      for (const { i } of hits) {
+        const s = geo.start[i], c = geo.counts[i];
+        for (let k = 0; k < c; k++) {
+          const n = geo.num[s + k].toLowerCase();
+          const exact = n === wanted;
+          if (pass === 0 ? !exact : exact || !n.startsWith(wanted)) continue;
+          out.push({ label: geo.names[i] + ", " + geo.num[s + k], lat: geo.lat[s + k], lon: geo.lon[s + k] });
+          if (out.length >= limit) return out;
+        }
+      }
+    }
+    if (out.length) return out;
+
+    // The number is not on the street. Catastro has real gaps — Avinguda del Port runs 99, 101 —
+    // so offer the closest door instead of pretending, and say that is what happened.
+    const target = parseInt(wanted, 10);
+    if (Number.isFinite(target)) {
+      for (const { i } of hits.slice(0, 3)) {
+        const s = geo.start[i], c = geo.counts[i];
+        let best = -1, bestD = Infinity;
+        for (let k = 0; k < c; k++) {
+          const v = parseInt(geo.num[s + k], 10);
+          if (!Number.isFinite(v)) continue;
+          const d = Math.abs(v - target);
+          if (d < bestD) { bestD = d; best = k; }
+        }
+        if (best >= 0) out.push({
+          label: `${geo.names[i]}, ${geo.num[s + best]}`,
+          hint: `nearest to ${wanted}`,
+          lat: geo.lat[s + best], lon: geo.lon[s + best],
+        });
+      }
+      if (out.length) return out;
+    }
+    // Nothing numbered at all — fall through to the streets themselves rather than an empty list.
+  }
+  for (const { i } of hits) {
+    const s = geo.start[i], c = geo.counts[i];
+    out.push({
+      label: geo.names[i],
+      hint: c ? (c > 1 ? `nos. ${geo.num[s]}–${geo.num[s + c - 1]}` : `no. ${geo.num[s]}`) : "",
+      // The middle entrance stands for the street: on a long one, its ends are a poor guess.
+      lat: geo.lat[s + (c >> 1)], lon: geo.lon[s + (c >> 1)],
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// Every typed word must begin some word of the name, so "pau" finds "Carrer de la Pau" and
+// "carrer pau" narrows it, while word order is not something the user has to guess.
+function matchStreets(geo, text, limit = 40) {
+  const toks = normalizeQ(text).split(" ").filter(Boolean);
+  if (!toks.length) return [];
+  const hits = [];
+  for (let i = 0; i < geo.norm.length; i++) {
+    const words = geo.norm[i];
+    let score = 0, ok = true;
+    for (const t of toks) {
+      let w = -1;
+      for (let j = 0; j < words.length; j++) if (words[j].startsWith(t)) { w = j; break; }
+      if (w < 0) { ok = false; break; }
+      score += words[w].length === t.length ? 2 : 1; // a whole word beats a prefix of one
+    }
+    if (!ok) continue;
+    // Prefer the tighter name: "Carrer de la Pau" over "Carrer de la Pau i la Concòrdia".
+    score -= words.join(" ").length / 200;
+    hits.push({ i, score });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  return hits.slice(0, limit);
 }
 
 // Trees whose position falls in an area, via the grid. A crown is a few metres across, so unlike
@@ -1538,14 +1700,133 @@ function setBusy(b) { document.getElementById("findBtn").disabled = b || !(marke
 function makeMarker(latlng, kind) {
   const m = L.marker(latlng, { draggable: true, title: kind }).addTo(map);
   m.bindTooltip(kind, { permanent: true, direction: "top", offset: [-15, -10] });
+  // A dragged marker no longer stands at the address the box names, so the box says where it is.
+  m.on("dragend", () => setField(kind, coordLabel(m.getLatLng())));
   return m;
 }
 map.on("click", (e) => {
-  if (!markerA) markerA = makeMarker(e.latlng, "A");
-  else if (!markerB) markerB = makeMarker(e.latlng, "B");
-  else { markerA.setLatLng(e.latlng); if (markerB) map.removeLayer(markerB); markerB = null; }
+  if (!markerA) { markerA = makeMarker(e.latlng, "A"); setField("A", coordLabel(e.latlng)); }
+  else if (!markerB) { markerB = makeMarker(e.latlng, "B"); setField("B", coordLabel(e.latlng)); }
+  else {
+    markerA.setLatLng(e.latlng); setField("A", coordLabel(e.latlng));
+    if (markerB) map.removeLayer(markerB);
+    markerB = null; setField("B", "");
+  }
   setBusy(false);
 });
+
+// ---------- search boxes ----------
+const coordLabel = (ll) => `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
+
+function setField(kind, text) {
+  const input = document.getElementById(kind === "A" ? "fromQ" : "toQ");
+  input.value = text;
+  input.closest(".geo").classList.toggle("filled", !!text);
+}
+
+// Place a marker from a search result, rather than from a click on the map.
+function setPoint(kind, lat, lon, label) {
+  const ll = L.latLng(lat, lon);
+  if (kind === "A") {
+    if (markerA) markerA.setLatLng(ll); else markerA = makeMarker(ll, "A");
+  } else {
+    if (markerB) markerB.setLatLng(ll); else markerB = makeMarker(ll, "B");
+  }
+  setField(kind, label);
+  // Show the point without zooming out of a closer view the user chose deliberately.
+  if (markerA && markerB) map.fitBounds(L.latLngBounds(markerA.getLatLng(), markerB.getLatLng()), { padding: [60, 60] });
+  else map.setView(ll, Math.max(map.getZoom(), 16));
+  setBusy(false);
+}
+
+function setupSearch(kind) {
+  const p = kind === "A" ? "from" : "to";
+  const input = document.getElementById(p + "Q");
+  const list = document.getElementById(p + "S");
+  const wrap = document.getElementById(p + "G");
+  let results = [], sel = -1;
+
+  const close = () => { list.classList.remove("open"); list.innerHTML = ""; results = []; sel = -1; };
+
+  const render = () => {
+    list.innerHTML = "";
+    if (!results.length) {
+      // Say so explicitly: a list that just fails to appear reads as a broken box.
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "No match in Valencia";
+      list.appendChild(li);
+    } else {
+      results.forEach((r, i) => {
+        const li = document.createElement("li");
+        li.className = i === sel ? "sel" : "";
+        li.setAttribute("role", "option");
+        li.textContent = r.label;
+        if (r.hint) {
+          const s = document.createElement("span");
+          s.className = "n"; s.textContent = r.hint;
+          li.appendChild(s);
+        }
+        // mousedown, not click: blur would tear the list down before a click ever lands.
+        li.addEventListener("mousedown", (e) => { e.preventDefault(); choose(i); });
+        list.appendChild(li);
+      });
+    }
+    list.classList.add("open");
+  };
+
+  const choose = (i) => {
+    const r = results[i];
+    if (!r) return;
+    close();
+    setPoint(kind, r.lat, r.lon, r.label);
+  };
+
+  input.addEventListener("input", () => {
+    wrap.classList.toggle("filled", !!input.value);
+    const q = input.value;
+    if (q.trim().length < 2) { close(); return; }
+    results = geoSearch(q);
+    sel = -1;
+    render();
+  });
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { close(); return; }
+    if (!list.classList.contains("open") || !results.length) {
+      if (e.key === "Enter") e.preventDefault();
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const dir = e.key === "ArrowDown" ? 1 : -1;
+      // From nothing highlighted, Down takes the first and Up wraps to the last.
+      sel = sel < 0 ? (dir > 0 ? 0 : results.length - 1)
+                    : (sel + dir + results.length) % results.length;
+      render();
+      const el = list.children[sel];
+      if (el) el.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      choose(sel < 0 ? 0 : sel); // Enter with nothing highlighted takes the best match
+    }
+  });
+
+  input.addEventListener("focus", () => { if (results.length) render(); });
+  input.addEventListener("blur", () => setTimeout(close, 120));
+
+  document.getElementById(p + "C").addEventListener("click", () => {
+    setField(kind, "");
+    close();
+    const m = kind === "A" ? markerA : markerB;
+    if (m) map.removeLayer(m);
+    if (kind === "A") markerA = null; else markerB = null;
+    setBusy(false);
+    input.focus();
+  });
+}
+setupSearch("A");
+setupSearch("B");
 document.getElementById("findBtn").onclick = findRoute;
 document.getElementById("shadeBtn").onclick = showShadowsOnly;
 
@@ -1575,7 +1856,7 @@ loadArtifact().then(() => {
     document.getElementById("shadeBtn").style.display = "none";
     shadowLayer.redraw();
   }
-  setStatus("Click the map to place A and B.");
+  setStatus(`Search an address or click the map. ${G.geo.names.length.toLocaleString()} streets loaded.`);
   setBusy(false);
 }).catch((e) => {
   setStatus("⚠️ Could not load map data: " + e.message);

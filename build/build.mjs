@@ -12,6 +12,8 @@ import path from "node:path";
 import { parseOpl } from "./parse-osm.mjs";
 import { buildGraph, components, stitch, CROSS_PENALTY_M } from "./build-graph.mjs";
 import { buildCanopy } from "./parse-trees.mjs";
+import { parseAddresses } from "./parse-addresses.mjs";
+import { joinStreetNames } from "./join-streets.mjs";
 
 const DATA = path.resolve(import.meta.dirname, "../data");
 const BBOX = [39.42, -0.42, 39.51, -0.32]; // s,w,n,e — Valencia city
@@ -137,6 +139,58 @@ const canopy = buildCanopy(trees, BBOX, Q);
               `${pct(s.byGroup, s.kept)} by group fallback, ${s.rows} distinct crowns`);
 }
 
+console.log("→ addresses");
+const { streets, addrs } = await parseAddresses(path.join(DATA, "A.ES.SDGC.AD.46900.gml"));
+// Clip to the routed bbox first: an address outside it has no graph to snap to, so shipping it
+// would only offer the user a destination the router cannot reach.
+const inBox = addrs.filter((a) =>
+  a.lat >= BBOX[0] && a.lat <= BBOX[2] && a.lon >= BBOX[1] && a.lon <= BBOX[3]);
+{
+  const j = joinStreetNames(streets, inBox, ways, nodeCoords).stats;
+  console.log(`  ${addrs.length} addresses -> ${inBox.length} in bbox, ${streets.length} streets`);
+  console.log(`  ${j.joined} named from OSM (${pct(j.joined, j.streets)}), ` +
+              `${j.contested} contested claims dropped, ${j.fallback} kept the Catastro name`);
+}
+
+// One entry per street, carrying its house numbers in human order. Numbers are what the search
+// box completes against once a street is picked, so they ship grouped rather than as free points.
+const byStreet = new Map();
+for (const a of inBox) {
+  let g = byStreet.get(a.s); if (!g) byStreet.set(a.s, g = []);
+  g.push(a);
+}
+// "12", "12A", "12B" all exist; sort by the number first so the list reads the way a street does.
+const numKey = (n) => {
+  const m = /^(\d*)(.*)$/.exec(n);
+  return [m[1] ? parseInt(m[1], 10) : Infinity, m[2]];
+};
+const sName = [], sAlias = [], sCount = [], aNum = [], aLon = [], aLat = [];
+let px = 0, py = 0, dropped = 0;
+for (const [si, list] of [...byStreet.entries()].sort((a, b) => a[0] - b[0])) {
+  // Several entrances can share a number (a block with two doors); one suggestion is enough.
+  const seen = new Set();
+  const uniq = list.filter((a) => !seen.has(a.n) && seen.add(a.n));
+  dropped += list.length - uniq.length;
+  uniq.sort((a, b) => {
+    const ka = numKey(a.n), kb = numKey(b.n);
+    return ka[0] - kb[0] || (ka[1] < kb[1] ? -1 : ka[1] > kb[1] ? 1 : 0);
+  });
+  const s = streets[si];
+  sName.push(s.display);
+  // Only when it says something the display name does not — the Catastro spelling is the Spanish
+  // one where OSM gave us Valencian, and it is what older paperwork carries.
+  sAlias.push(s.alias && s.alias !== s.display ? s.alias : "");
+  sCount.push(uniq.length);
+  for (const a of uniq) {
+    aNum.push(a.n);
+    const x = Math.round(a.lon * Q), y = Math.round(a.lat * Q);
+    aLon.push(x - px); aLat.push(y - py);
+    px = x; py = y;
+  }
+}
+console.log(`  ${sName.length} streets, ${aNum.length} numbered entrances ` +
+            `(${dropped} duplicate numbers merged)`);
+
 const artifact = {
   meta: {
     city: "Valencia", bbox: BBOX, quant: Q,
@@ -145,10 +199,12 @@ const artifact = {
       buildings: "Catastro INSPIRE BU 46900 (buildingpart)",
       streets: "OpenStreetMap via Geofabrik",
       trees: "Ajuntament de València, Servicio de Parques y Jardines (CC BY 4.0)",
+      addresses: "Catastro INSPIRE AD 46900, street names from OpenStreetMap",
     },
     counts: {
       nodes: keptNodes.length, edges: eLen.length,
       buildings: bRings.length, trees: canopy.tSp.length,
+      streets: sName.length, addresses: aNum.length,
     },
     crossPenaltyM: CROSS_PENALTY_M,
     // Crown dimension table, indexed by tSp: [height, crownDiameter, crownBase] in decimetres,
@@ -178,6 +234,10 @@ const artifact = {
   tLon: canopy.tLon,
   tLat: canopy.tLat,
   tSp: canopy.tSp,
+  // Geocoder. Streets are a short list the browser scans linearly — 3k entries is nothing — and
+  // house numbers hang off them by count rather than by a repeated street id, so `sCount` is the
+  // only join needed. Positions are entrance points, delta-encoded like everything else.
+  sName, sAlias, sCount, aNum, aLon, aLat,
 };
 
 const out = path.join(DATA, "valencia.json");

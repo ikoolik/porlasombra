@@ -11,6 +11,8 @@ BBOX    := -0.42,39.42,-0.32,39.51
 PBF     := $(DATA)/valencia-latest.osm.pbf
 CATZIP  := $(DATA)/catastro-46900.zip
 GML     := $(DATA)/A.ES.SDGC.BU.46900.buildingpart.gml
+ADZIP   := $(DATA)/catastro-ad-46900.zip
+ADGML   := $(DATA)/A.ES.SDGC.AD.46900.gml
 OPL     := $(DATA)/walkable.opl
 BLD     := $(DATA)/buildings.json
 TREES   := $(DATA)/trees.json
@@ -46,6 +48,16 @@ $(GML): $(CATZIP)
 $(BLD): $(GML) parse-catastro.mjs lib/geo.mjs
 	node parse-catastro.mjs $(GML) $@
 
+# --- addresses: Spanish Cadastre (INSPIRE), a separate dataset from the buildings ---
+# Entrance points with a street name and house number — what the search box resolves against.
+$(ADZIP): | $(DATA)
+	curl -sSL --cacert $(CA) -o $@ \
+	  https://www.catastro.hacienda.gob.es/INSPIRE/addresses/46/46900-VALENCIA/A.ES.SDGC.AD.46900.zip
+
+$(ADGML): $(ADZIP)
+	unzip -o -q $< -d $(DATA)
+	touch $@
+
 # --- trees: Valencia municipal inventory (ArcGIS REST, CC BY 4.0) ---
 # 80 pages of 2,000 over one endpoint, ~2 min. Refreshed annually upstream, so this is the
 # slowest-moving of the three sources; delete the file to force a re-pull.
@@ -53,8 +65,8 @@ $(TREES): fetch-trees.mjs | $(DATA)
 	node fetch-trees.mjs $@
 
 # --- artifact ---
-$(OUT): $(OPL) $(BLD) $(TREES) build.mjs build-graph.mjs parse-osm.mjs parse-trees.mjs \
-        lib/geo.mjs lib/species.mjs
+$(OUT): $(OPL) $(BLD) $(TREES) $(ADGML) build.mjs build-graph.mjs parse-osm.mjs parse-trees.mjs \
+        parse-addresses.mjs join-streets.mjs lib/geo.mjs lib/species.mjs
 	node --max-old-space-size=8192 build.mjs
 
 # --- publish ---
