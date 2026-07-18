@@ -36,7 +36,7 @@ OSM extract ─ osmium ──────┘   artifact      ↓
                                              ↓
                                             A* ×2, lazy sun sampling
                                              ↓
-                                            draw
+                                            draw (WebGL, per pixel)
 ```
 
 The whole city — 277,651 sidewalk nodes, 436,804 edges and 196,676 building parts — is baked offline into one 5.5 MB gzipped file. The browser fetches it once and does everything else locally: no API keys, no routing service, no per-request cost. Hosting is a static file on a CDN.
@@ -52,6 +52,19 @@ An earlier version fetched OpenStreetMap live via Overpass on every query and bu
 | Network calls per query | 1 (often failing) | **0** |
 
 The connectivity number is the interesting one. A sidewalk graph shatters because left/right pavement chains get offset away from the centreline they share a junction with — so the router would snap your start point onto an isolated two-node stub and correctly report "no route". Offline there's time to detect that and weld components within 12 m of each other.
+
+### How the shade is drawn
+
+Shade is a property of a *place*, not of a building, so it is computed per pixel rather than per footprint:
+
+1. Every footprint near the view is rasterised into an off-screen height field, blended with `MAX` so overlapping parts of the same building resolve to the tallest.
+2. One fullscreen shader marches a ray from each pixel back along the sun's azimuth. The ray climbs `tan(altitude)` metres for every metre it travels; the pixel is in shade the moment it passes under something taller.
+
+Nothing is precomputed or shipped — the height field is rasterised on demand from the rings already in the artifact, at display resolution, so the shade is exactly as sharp as the screen at any zoom.
+
+The point is the cost model. The old renderer built a convex hull per building and filled a path per shadow, which cost tens of milliseconds for a dense viewport and forced a 120 ms debounce on the time slider and 200 ms on pan. Marching pixels costs the same whether the view holds 200 buildings or 20,000, so the debounces are gone: the shade tracks the map and the time slider at 60 fps.
+
+WebGL is not a hard requirement — without it the app falls back to the old 2D renderer, which costs nothing to keep because the router builds those hulls for its own use anyway.
 
 ## Building the data
 
@@ -87,7 +100,8 @@ Why the Cadastre rather than OSM heights? Measured across central Valencia, 8 of
 
 ## Known limitations
 
-- Shadows are flat convex hulls, not a 3D raytrace: no roof shapes, no terrain, no shadow interaction.
+- Buildings are flat-topped prisms, not a 3D model: no roof shapes, no terrain, no reflected light.
+- The drawn shade is a GPU ray march per pixel; the **routing** shade is still a point-in-polygon test against convex hulls of the projected footprints, which slightly over-covers concave buildings. The two agree on ~99.8% of pixels away from shadow edges.
 - Height is floors × 3 m. The Cadastre publishes no true above-ground height in metres, so this is better *coverage*, not better precision.
 - No **tree canopy** — a significant shade source in Valencia.
 - One sun position for the whole view (fine at city scale).

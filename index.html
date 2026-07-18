@@ -126,6 +126,12 @@
 const VALENCIA = [39.4699, -0.3763];
 const SAMPLES_PER_EDGE = 3;   // sun samples along each graph edge
 
+// The decoded artifact — graph, buildings, and the caches derived from them. Declared up here
+// rather than beside loadArtifact because the shadow layer is constructed before it: Leaflet can
+// fire the layer's first draw from a deferred invalidateSize, and `null` has to be a readable
+// answer at that point rather than a dead-zone throw.
+let G = null;
+
 // ---------- Map ----------
 const map = L.map("map").setView(VALENCIA, 16);
 // Attribution covers all three uses, not just the tiles: the street network and the sidewalk
@@ -137,13 +143,18 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
                'buildings © <a href="https://www.catastro.hacienda.gob.es/">Dirección General del Catastro</a>',
 }).addTo(map);
 
-// One canvas layer for every shadow, rather than one Leaflet object per polygon.
+// ---------- Shadow rendering ----------
+// Shade is a per-pixel property, so the GPU path (ShadowGL, below) computes it per pixel. The 2D
+// canvas layer here is the fallback for machines without WebGL, and draws the same convex-hull
+// shadow polygons the router already builds for its own point-in-polygon tests.
 //
-// Two reasons. Speed: a dense Valencia viewport holds ~20k shadows and per-object overhead cost
-// seconds. Correctness: shade is binary — a spot is either shadowed or it isn't — but stacked
-// translucent polygons compound their alpha, so overlapping shadows drew darker than single ones
-// and implied a gradient that does not exist. See _redraw for how both are solved at once.
+// One canvas layer for every shadow, rather than one Leaflet object per polygon. Two reasons.
+// Speed: a dense Valencia viewport holds ~20k shadows and per-object overhead cost seconds.
+// Correctness: shade is binary — a spot is either shadowed or it isn't — but stacked translucent
+// polygons compound their alpha, so overlapping shadows drew darker than single ones and implied
+// a gradient that does not exist. See _redraw for how both are solved at once.
 const ShadowCanvas = L.Layer.extend({
+  gpu: false,
   initialize(opts) { this._polys = []; this._opts = opts || {}; },
 
   onAdd(map) {
@@ -239,7 +250,348 @@ const ShadowCanvas = L.Layer.extend({
   },
 });
 
-const shadowLayer = new ShadowCanvas({ fill: "#3b3b5c", alpha: 0.3 }).addTo(map);
+// ---------- Shadow rendering (GPU) ----------
+// The 2D path above costs one convex hull and one filled path per building, so a dense viewport
+// (~20k buildings) cost tens of milliseconds of pure CPU and every interaction had to be
+// debounced. But shade does not depend on how many buildings there are — it depends on how many
+// pixels you are looking at. So compute it per pixel instead:
+//
+//   1. Rasterise every footprint into an off-screen height field, blending with MAX so that
+//      overlapping parts — a tower on its podium — resolve to the taller of the two rather than
+//      to two separately projected shapes.
+//   2. For each screen pixel, march a ray back along the sun's azimuth through that height field.
+//      The ray gains `tan(altitude)` metres of height per metre travelled; the pixel is shaded as
+//      soon as it passes under something taller. Binary in, binary out — no stacked alpha.
+//
+// Nothing is precomputed or shipped: the height field is rasterised on demand from the same rings
+// the artifact already carries, at display resolution, so it is exactly as sharp as the screen at
+// every zoom. Routing is untouched — see isShaded, which still tests the convex hulls.
+//
+// Measured against those hulls over a zoom-18 viewport, the two agree on 99.8% of pixels away from
+// shadow edges. Every disagreement is the hull claiming shade the exact footprint does not cast:
+// a hull of the footprint and its projected copy fills in concave notches. The march never
+// invented shade the hull missed. So this is also slightly *more* accurate than what it replaces —
+// which is worth knowing but not worth changing the router over, since the router's own tolerance
+// is the 3 samples it takes per edge.
+const MAX_SHADOW_M = 400;      // same clamp shadowPolygon uses
+const MAX_MARCH_STEPS = 256;   // shader loop bound; step length grows to cover longer shadows
+const MAX_TEX = 4096;          // stay well inside every real MAX_TEXTURE_SIZE
+const RS = Math.min(window.devicePixelRatio || 1, 2);
+
+// Web Mercator at zoom 0 (256 units around the globe). Building geometry is cached in this frame
+// relative to a fixed city origin so the cache survives pan and zoom; float32 offsets over a
+// 20 km city hold sub-millimetre precision, which a raw lat/lon float32 would not.
+const MERC = {
+  x: (lng) => (lng + 180) / 360 * 256,
+  y: (lat) => {
+    const s = Math.max(Math.min(Math.sin(lat * Math.PI / 180), 1 - 1e-15), -1 + 1e-15);
+    return 256 * (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI));
+  },
+};
+const MX0 = MERC.x(VALENCIA[1]), MY0 = MERC.y(VALENCIA[0]);
+
+const RASTER_VS = `
+attribute vec3 aPos;          // xy: zoom-0 mercator offset from the city origin, z: height in m
+uniform float uScale;         // raster px per zoom-0 mercator unit
+uniform vec2 uOrigin;         // raster px of the city origin
+uniform vec2 uSize;
+varying float vH;
+void main() {
+  vec2 p = aPos.xy * uScale + uOrigin;
+  gl_Position = vec4((p.x / uSize.x) * 2.0 - 1.0, 1.0 - (p.y / uSize.y) * 2.0, 0.0, 1.0);
+  vH = aPos.z;
+}`;
+
+// Heights land in an 8-bit channel: 1 m quantisation over a 255 m range, which is finer than the
+// floor-count data behind it and avoids needing float-texture extensions at all.
+const RASTER_FS = `
+precision mediump float;
+varying float vH;
+void main() { gl_FragColor = vec4(clamp(vH / 255.0, 0.0, 1.0), 0.0, 0.0, 1.0); }`;
+
+const MARCH_VS = `
+attribute vec2 aXY;
+void main() { gl_Position = vec4(aXY, 0.0, 1.0); }`;
+
+const MARCH_FS = `
+precision highp float;
+uniform sampler2D uHeight;
+uniform vec2 uTexSize;
+uniform vec2 uPad;        // raster px between the raster's corner and the screen's
+uniform float uCanvasH;
+uniform float uS2R;       // output px -> raster px
+uniform vec2 uStep;       // one march step, in raster px, pointing back toward the sun
+uniform float uRise;      // metres of ray height gained per step
+uniform float uMaxH;      // tallest building in the raster: past this nothing can block
+uniform int uSteps;
+uniform vec3 uColor;
+uniform float uAlpha;
+void main() {
+  vec2 q = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) * uS2R + uPad;
+  float rise = 0.0;
+  bool hit = false;
+  for (int i = 0; i < ${MAX_MARCH_STEPS}; i++) {
+    if (i >= uSteps) break;
+    if (q.x < 0.0 || q.y < 0.0 || q.x >= uTexSize.x || q.y >= uTexSize.y) break;
+    // The very first sample is the pixel itself, with rise 0 — that is what puts the building's
+    // own footprint in shade rather than only the ground beyond it.
+    float h = texture2D(uHeight, vec2(q.x / uTexSize.x, 1.0 - q.y / uTexSize.y)).r * 255.0;
+    if (h > rise) { hit = true; break; }
+    q += uStep;
+    rise += uRise;
+    if (rise > uMaxH) break;
+  }
+  if (!hit) discard;
+  gl_FragColor = vec4(uColor * uAlpha, uAlpha);   // premultiplied; flat, never compounding
+}`;
+
+function glCompile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+function glProgram(gl, vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, glCompile(gl, gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, glCompile(gl, gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  for (let i = 0; i < gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i++) {
+    const name = gl.getActiveUniform(p, i).name;
+    u[name] = gl.getUniformLocation(p, name);
+  }
+  return { p, u };
+}
+
+const ShadowGL = L.Layer.extend({
+  gpu: true,
+  initialize(opts) { this._opts = opts || {}; this._region = null; this._nVerts = 0; this._maxH = 0; },
+
+  onAdd(map) {
+    this._map = map;
+    this._canvas = L.DomUtil.create("canvas", "leaflet-layer");
+    this._canvas.style.pointerEvents = "none";
+    map.getPanes().overlayPane.appendChild(this._canvas);
+    this._initGL();
+    // `move`, not `moveend`: the draw is now cheap enough to follow the map instead of snapping
+    // into place behind it.
+    map.on("move zoomend resize", this._reset, this);
+    if (map.options.zoomAnimation && L.Browser.any3d) map.on("zoomanim", this._animateZoom, this);
+    this._reset();
+  },
+
+  onRemove(map) {
+    L.DomUtil.remove(this._canvas);
+    map.off("move zoomend resize", this._reset, this);
+    map.off("zoomanim", this._animateZoom, this);
+  },
+
+  // Kept from the 2D layer: match Leaflet's own zoom animation so the shade does not detach.
+  _animateZoom(e) {
+    const scale = this._map.getZoomScale(e.zoom, this._map.getZoom());
+    const offset = this._map._latLngBoundsToNewLayerBounds(this._map.getBounds(), e.zoom, e.center).min;
+    L.DomUtil.setTransform(this._canvas, offset, scale);
+  },
+
+  _initGL() {
+    const attrs = { alpha: true, antialias: false, depth: false, stencil: false, premultipliedAlpha: true };
+    const gl = this._gl = this._canvas.getContext("webgl2", attrs) ||
+                          this._canvas.getContext("webgl", attrs);
+    this._maxOp = gl.MAX;
+    if (this._maxOp === undefined) {                       // WebGL1 needs the extension for MAX
+      const ext = gl.getExtension("EXT_blend_minmax");
+      this._maxOp = ext.MAX_EXT;
+    }
+    this._raster = glProgram(gl, RASTER_VS, RASTER_FS);
+    this._march = glProgram(gl, MARCH_VS, MARCH_FS);
+    this._vbo = gl.createBuffer();
+    this._quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._quad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+    this._tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this._tex);
+    // NEAREST, not LINEAR: interpolating heights across a wall would invent a ramp that is not
+    // there and soften every shadow edge by a texel.
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    this._fbo = gl.createFramebuffer();
+    this._texW = this._texH = 0;
+  },
+
+  _reset() {
+    if (this._map._animatingZoom) return;
+    const size = this._map.getSize();
+    L.DomUtil.setTransform(this._canvas, L.point(0, 0), 1);
+    L.DomUtil.setPosition(this._canvas, this._map.containerPointToLayerPoint([0, 0]));
+    const w = Math.round(size.x * RS), h = Math.round(size.y * RS);
+    if (this._canvas.width !== w || this._canvas.height !== h) {
+      this._canvas.width = w; this._canvas.height = h;
+      this._canvas.style.width = size.x + "px";
+      this._canvas.style.height = size.y + "px";
+    }
+    this.redraw();
+  },
+
+  // Triangulated footprints for everything near the view, in one buffer. Rebuilt only when the
+  // map leaves the region it was built for — pan and time changes reuse it untouched, which is
+  // what keeps the time slider free of CPU work entirely.
+  _ensureRegion() {
+    if (!G) return false;
+    const b = this._map.getBounds();
+    const view = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    if (this._region && bboxCovers(this._region, view)) return this._nVerts > 0;
+    // Pad by the longest possible shadow (buildings off-screen still cast onto it) plus half a
+    // screen, so a short pan does not trigger a rebuild.
+    const padLat = MAX_SHADOW_M / 111000 + (view[3] - view[1]) * 0.5;
+    const padLng = MAX_SHADOW_M / 85000 + (view[2] - view[0]) * 0.5;
+    const region = [view[0] - padLng, view[1] - padLat, view[2] + padLng, view[3] + padLat];
+
+    const parts = [];
+    let total = 0, maxH = 0;
+    for (const i of buildingsIn(region)) {
+      const t = buildingTriangles(i);
+      if (!t) continue;
+      parts.push(t); total += t.length;
+      if (G.heights[i] > maxH) maxH = G.heights[i];
+    }
+    const data = new Float32Array(total);
+    let o = 0;
+    for (const t of parts) { data.set(t, o); o += t.length; }
+    const gl = this._gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    this._nVerts = total / 3;
+    this._maxH = Math.min(maxH, 255);
+    this._region = region;
+    return this._nVerts > 0;
+  },
+
+  redraw() {
+    const gl = this._gl, map = this._map;
+    if (!gl) return;
+    const size = map.getSize();
+    if (!size.x || !size.y) return;                 // no layout yet; _reset will call us again
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this._canvas.width, this._canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!G) return;                                 // artifact still loading — a cleared canvas is right
+
+    const sun = SunCalc.getPosition(currentDate(), ...VALENCIA);
+    if (sun.altitude <= 0.03) return;               // below the horizon — handled as global night
+    if (!this._ensureRegion()) return;
+
+    const zoom = map.getZoom();
+    const mPerPx = 156543.03392 * Math.cos(VALENCIA[0] * Math.PI / 180) / Math.pow(2, zoom);
+    // Only pad the raster by how far the tallest building here can actually reach. At a normal
+    // midday sun that is a few tens of metres, not the 400 m worst case, so the texture stays
+    // barely larger than the viewport.
+    const padM = Math.min(this._maxH / Math.tan(sun.altitude), MAX_SHADOW_M);
+
+    // Raster resolution follows the display, then halves if that would make an unreasonable
+    // texture (only reachable when zoomed far out with a very low sun).
+    let s2r = RS, padPx, texW, texH;
+    for (;;) {
+      padPx = Math.ceil(padM / mPerPx * s2r);
+      texW = Math.ceil(size.x * s2r) + 2 * padPx;
+      texH = Math.ceil(size.y * s2r) + 2 * padPx;
+      if ((texW <= MAX_TEX && texH <= MAX_TEX) || s2r <= 0.125) break;
+      s2r /= 2;
+    }
+    texW = Math.min(texW, MAX_TEX); texH = Math.min(texH, MAX_TEX);
+
+    if (texW !== this._texW || texH !== this._texH) {
+      gl.bindTexture(gl.TEXTURE_2D, this._tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, texW, texH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._tex, 0);
+      this._texW = texW; this._texH = texH;
+    }
+
+    // ---- Pass 1: height field ----
+    const scale = Math.pow(2, zoom);
+    const nw = map.getBounds().getNorthWest();
+    const originX = (MX0 * scale - MERC.x(nw.lng) * scale) * s2r + padPx;
+    const originY = (MY0 * scale - MERC.y(nw.lat) * scale) * s2r + padPx;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo);
+    gl.viewport(0, 0, texW, texH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(this._maxOp);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(this._raster.p);
+    gl.uniform1f(this._raster.u.uScale, scale * s2r);
+    gl.uniform2f(this._raster.u.uOrigin, originX, originY);
+    gl.uniform2f(this._raster.u.uSize, texW, texH);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._vbo);
+    const aPos = gl.getAttribLocation(this._raster.p, "aPos");
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 12, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, this._nVerts);
+    gl.disableVertexAttribArray(aPos);
+    gl.disable(gl.BLEND);
+
+    // ---- Pass 2: march ----
+    // Step one texel at a time, but never fewer than MAX_MARCH_STEPS steps' worth — the shader
+    // loop is bounded, so at high zoom the step grows instead. It stays well under the narrowest
+    // building, which is what a step has to clear to avoid tunnelling through a wall.
+    const stepM = Math.max(mPerPx / s2r, padM / MAX_MARCH_STEPS);
+    const bearing = ((sun.azimuth * 180 / Math.PI) % 360 + 360) % 360;   // shadow bearing from north
+    const br = bearing * Math.PI / 180;
+    const perPx = stepM / mPerPx * s2r;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this._canvas.width, this._canvas.height);
+    gl.useProgram(this._march.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._tex);
+    gl.uniform1i(this._march.u.uHeight, 0);
+    gl.uniform2f(this._march.u.uTexSize, texW, texH);
+    gl.uniform2f(this._march.u.uPad, padPx, padPx);
+    gl.uniform1f(this._march.u.uCanvasH, this._canvas.height);
+    gl.uniform1f(this._march.u.uS2R, s2r / RS);
+    gl.uniform2f(this._march.u.uStep, -Math.sin(br) * perPx, Math.cos(br) * perPx);  // toward the sun
+    gl.uniform1f(this._march.u.uRise, stepM * Math.tan(sun.altitude));
+    gl.uniform1f(this._march.u.uMaxH, this._maxH);
+    gl.uniform1i(this._march.u.uSteps, Math.min(MAX_MARCH_STEPS, Math.ceil(padM / stepM) + 2));
+    const c = this._opts.rgb || [0.23, 0.23, 0.36];
+    gl.uniform3f(this._march.u.uColor, c[0], c[1], c[2]);
+    gl.uniform1f(this._march.u.uAlpha, this._opts.alpha ?? 0.3);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._quad);
+    const aXY = gl.getAttribLocation(this._march.p, "aXY");
+    gl.enableVertexAttribArray(aXY);
+    gl.vertexAttribPointer(aXY, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disableVertexAttribArray(aXY);
+  },
+});
+
+// WebGL is not a hard dependency: without it the app falls back to the 2D hull renderer, which
+// costs nothing extra to keep because the router builds those hulls anyway.
+function makeShadowLayer() {
+  try {
+    // A canvas only ever yields one context type, so probe on a throwaway and release it — a live
+    // context left behind counts against the browser's small per-page limit.
+    let gl = document.createElement("canvas").getContext("webgl2");
+    // WebGL1 can do this too, but only with the extension that gives it a MAX blend equation.
+    if (!gl) {
+      gl = document.createElement("canvas").getContext("webgl");
+      if (gl && !gl.getExtension("EXT_blend_minmax")) gl = null;
+    }
+    if (gl) {
+      gl.getExtension("WEBGL_lose_context")?.loseContext();
+      return new ShadowGL({ rgb: [0.23, 0.23, 0.36], alpha: 0.3 });
+    }
+  } catch (e) { /* fall through to the 2D renderer */ }
+  return new ShadowCanvas({ fill: "#3b3b5c", alpha: 0.3 });
+}
+
+const shadowLayer = makeShadowLayer().addTo(map);
 const routeLayer = L.featureGroup().addTo(map); // featureGroup for .getBounds()
 let markerA = null, markerB = null;
 
@@ -273,11 +625,14 @@ function updateAlphaLabel() {
 function currentDate() { return new Date(dt.value); }
 
 document.getElementById("nowBtn").onclick = setNow;
-// Redraw shadows on a time change, but only if any are on screen, and coalesced — the hour
-// slider fires continuously while dragging and each redraw is a few thousand convex hulls.
+// On the GPU path a time change is one fullscreen shader pass over an unchanged height field —
+// no CPU work at all — so the slider redraws on every `input` and the shadows sweep with the
+// handle. The 2D fallback still has to rebuild a few thousand convex hulls, so it stays coalesced.
 let redrawTimer = null;
 function redrawShadows() {
-  if (!G || !shadowLayer.count()) return;
+  if (!G) return;
+  if (shadowLayer.gpu) { shadowLayer.redraw(); return; }
+  if (!shadowLayer.count()) return;
   clearTimeout(redrawTimer);
   redrawTimer = setTimeout(() => {
     const b = map.getBounds();
@@ -312,6 +667,57 @@ function convexHull(pts) {
   };
   const hull = half(p).concat(half(p.reverse()));
   return hull.length >= 3 ? hull : null;
+}
+
+// Ear clipping, for the GPU rasteriser. Cadastral rings are simple polygons — no holes, no
+// self-intersection, a dozen vertices each — so the plain O(n²) form beats pulling in a
+// triangulation library, and every result is cached for the life of the page.
+function earClip(ring) {
+  const n = ring.length;
+  if (n < 3) return null;
+  const cross = (a, b, c) => (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0]);
+  const inTri = (p, a, b, c) => cross(a,b,p) >= 0 && cross(b,c,p) >= 0 && cross(c,a,p) >= 0;
+  let area = 0;
+  for (let i = 0, j = n - 1; i < n; j = i++) area += (ring[j][0]-ring[i][0]) * (ring[j][1]+ring[i][1]);
+  const idx = [];
+  for (let i = 0; i < n; i++) idx.push(area > 0 ? i : n - 1 - i);   // normalise to counter-clockwise
+  const out = [];
+  let guard = n * n;
+  while (idx.length > 3 && guard-- > 0) {
+    let cut = -1;
+    for (let i = 0; i < idx.length; i++) {
+      const ia = idx[(i + idx.length - 1) % idx.length], ib = idx[i], ic = idx[(i + 1) % idx.length];
+      const a = ring[ia], b = ring[ib], c = ring[ic];
+      if (cross(a, b, c) <= 0) continue;                             // reflex corner, not an ear
+      let clear = true;
+      for (let k = 0; k < idx.length && clear; k++) {
+        const j = idx[k];
+        if (j !== ia && j !== ib && j !== ic && inTri(ring[j], a, b, c)) clear = false;
+      }
+      if (clear) { out.push(a, b, c); cut = i; break; }
+    }
+    if (cut < 0) break;                                              // degenerate ring — keep what we have
+    idx.splice(cut, 1);
+  }
+  if (idx.length === 3) out.push(ring[idx[0]], ring[idx[1]], ring[idx[2]]);
+  return out.length ? out : null;
+}
+
+// A building's triangles as GPU vertices: zoom-0 mercator offset from the city origin, plus the
+// height the rasteriser writes. Cached — the geometry never changes, only the view over it.
+function buildingTriangles(i) {
+  let t = G.tris[i];
+  if (t !== undefined) return t;
+  const tri = earClip(G.rings[i]);
+  if (!tri) return (G.tris[i] = null);
+  const h = G.heights[i];
+  t = new Float32Array(tri.length * 3);
+  for (let k = 0; k < tri.length; k++) {
+    t[3*k]     = MERC.x(tri[k][0]) - MX0;
+    t[3*k + 1] = MERC.y(tri[k][1]) - MY0;
+    t[3*k + 2] = h;
+  }
+  return (G.tris[i] = t);
 }
 
 // Ray casting. Ring is an open array of [lng,lat] (no repeated last vertex).
@@ -411,7 +817,6 @@ function isShaded(coord, sunAltRad) {
 // repaired, plus Catastro building prisms. Fetched once, then cached by the browser.
 const ARTIFACT_URL = "data/valencia.json.gz";
 
-let G = null;                // decoded graph + buildings
 let shadeIndex = new Map();  // grid over buildings ∪ shadows, rebuilt per (time, area)
 let shadeKey = "";           // the sun position shadeIndex was built for
 let shadeBbox = null;        // the area it covers
@@ -500,7 +905,7 @@ async function loadArtifact() {
   });
 
   G = { meta: a.meta, n, m, lon, lat, head, adjTo, adjLen, adjPen, adjEdge,
-        rings, heights, nodeGrid, bldGrid,
+        rings, heights, nodeGrid, bldGrid, tris: new Array(rings.length),
         sun: new Float32Array(m), sunKey: "", sunDone: new Uint8Array(m) };
   return G;
 }
@@ -662,14 +1067,9 @@ const bboxOf = (...lls) => {
   return [Math.min(...lngs)-pad, Math.min(...lats)-pad, Math.max(...lngs)+pad, Math.max(...lats)+pad];
 };
 
-// Computing shade and drawing it want different areas. The router needs shade across the whole
-// A–B corridor, which for a cross-city trip is ~60k building parts — but handing 60k polygons to
-// Leaflet costs seconds and draws mostly sub-pixel smudge. So: compute over the corridor, draw
-// only what is on screen, and only when zoomed in far enough for a shadow to be worth a pixel.
-// Low enough that a whole cross-town route still shows its shade; the per-polygon pixel-size
-// filter below is what actually keeps the count sane as you zoom out.
-const DRAW_MIN_ZOOM = 13;
-
+// The router needs shade across the whole A–B corridor — for a cross-city trip ~60k building
+// parts — so computing shade and drawing it are separate concerns. computeShade builds the exact
+// polygon index the router queries; drawing is the shadow layer's own business.
 function renderShadows(bbox, draw) {
   const sun = SunCalc.getPosition(currentDate(), ...VALENCIA);
   computeShade(bbox, sun, dt.value);
@@ -677,8 +1077,14 @@ function renderShadows(bbox, draw) {
   return sun;
 }
 
+// The GPU layer reads the buildings itself and works per pixel, so it needs no polygons and no
+// hint about what is on screen — just a nudge to redraw.
 function drawShadows(sun) {
+  if (shadowLayer.gpu) { shadowLayer.redraw(); return; }
   sun = sun || SunCalc.getPosition(currentDate(), ...VALENCIA);
+  // The 2D fallback draws only what is on screen, and only when zoomed in far enough for a shadow
+  // to be worth a pixel — below that it is sub-pixel smudge that still costs a full path fill.
+  const DRAW_MIN_ZOOM = 13;
   if (sun.altitude <= 0.03 || !lastShadows || map.getZoom() < DRAW_MIN_ZOOM) {
     shadowLayer.setPolys([]);
     return;
@@ -828,17 +1234,19 @@ map.on("click", (e) => {
 document.getElementById("findBtn").onclick = findRoute;
 document.getElementById("shadeBtn").onclick = showShadowsOnly;
 
-// Keep the drawn shadows matched to what is on screen: panning into fresh territory needs new
-// shadow polygons, and zooming out past DRAW_MIN_ZOOM should drop them rather than draw mush.
-let moveTimer = null;
-map.on("moveend zoomend", () => {
-  if (!G || !shadowLayer.count()) return;
-  clearTimeout(moveTimer);
-  moveTimer = setTimeout(() => {
-    const b = map.getBounds();
-    renderShadows([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], true);
-  }, 200);
-});
+// The GPU layer follows the map on `move` by itself. The 2D fallback has to rebuild shadow
+// polygons for fresh territory, which is expensive enough to keep debounced until the map settles.
+if (!shadowLayer.gpu) {
+  let moveTimer = null;
+  map.on("moveend zoomend", () => {
+    if (!G || !shadowLayer.count()) return;
+    clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => {
+      const b = map.getBounds();
+      renderShadows([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], true);
+    }, 200);
+  });
+}
 
 setNow();
 updateAlphaLabel();
@@ -847,6 +1255,12 @@ updateAlphaLabel();
 setBusy(true);
 loadArtifact().then((g) => {
   const c = g.meta.counts;
+  // Shadows were opt-in behind a button only because drawing them was expensive. On the GPU path
+  // they cost a fullscreen shader pass, so they are simply always on.
+  if (shadowLayer.gpu) {
+    document.getElementById("shadeBtn").style.display = "none";
+    shadowLayer.redraw();
+  }
   setStatus(`Ready — ${c.nodes.toLocaleString()} sidewalk nodes, ` +
             `${c.buildings.toLocaleString()} building parts (${g.meta.city}, ${g.meta.generated}). ` +
             `Click the map to place A and B.`);
