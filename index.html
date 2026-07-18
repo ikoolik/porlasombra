@@ -397,7 +397,7 @@ uniform float uCanvasH;
 uniform float uS2R;       // output px -> raster px
 uniform vec2 uStep;       // one march step, in raster px, pointing back toward the sun
 uniform float uRise;      // metres of ray height gained per step
-uniform float uStepM;     // metres of ground covered per step
+uniform float uStepM;     // metres of ray travelled per step, in 3D — not ground distance
 uniform float uMaxH;      // tallest occluder in the raster: past this nothing can block
 uniform int uSteps;
 uniform vec3 uColor;
@@ -423,6 +423,12 @@ void main() {
         // after one crown's worth of foliage, so normalising the exponent by crown depth makes a
         // full traverse cost exactly tau no matter how finely the ray happens to be stepped —
         // otherwise the shade would darken every time the step size changed with zoom.
+        //
+        // uStepM is the ray's own length, not its ground distance. At a high sun those differ by
+        // 3x: the ray climbs tan(altitude) metres for every metre it travels, so a crown it
+        // crosses in 3 m of ground is 10 m of actual foliage. Measuring the ground distance made
+        // canopy far too sheer at midday, and made the drawn shade disagree with the router,
+        // which applies the crown's tau once and in full.
         T *= pow(max(1.0 - s.a, 0.02), uStepM / max(top - base, 1.0));
       }
     }
@@ -710,7 +716,9 @@ const ShadowGL = L.Layer.extend({
     gl.uniform1f(this._march.u.uS2R, s2r / RS);
     gl.uniform2f(this._march.u.uStep, -Math.sin(br) * perPx, Math.cos(br) * perPx);  // toward the sun
     gl.uniform1f(this._march.u.uRise, stepM * Math.tan(sun.altitude));
-    gl.uniform1f(this._march.u.uStepM, stepM);
+    // The ray's own step length, not its ground step: at a 70° sun this is over 3x longer, and
+    // it is the distance that actually passes through foliage.
+    gl.uniform1f(this._march.u.uStepM, stepM / Math.max(Math.cos(sun.altitude), 0.15));
     gl.uniform1f(this._march.u.uMaxH, this._maxH);
     gl.uniform1i(this._march.u.uSteps, Math.min(MAX_MARCH_STEPS, Math.ceil(padM / stepM) + 2));
     gl.uniform3f(this._march.u.uColor, c[0], c[1], c[2]);
