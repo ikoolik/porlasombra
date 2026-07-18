@@ -92,6 +92,15 @@ dist: $(OUT)
 	rm -rf $(DIST) && mkdir -p $(DIST)/data
 	cp ../index.html ../_headers $(DIST)/
 	cp $(OUT) $(DIST)/data/
+	@# Stamp the artifact URL with a content hash. _headers caches /data/* for a day, which is
+	@# right for a 6 MB file that changes quarterly — but the filename never changed, so a
+	@# returning visitor kept yesterday's city. That failed silently the first time it mattered:
+	@# the rebuild that added the search index shipped, and anyone with a warm cache got a working
+	@# map whose search answered "no results" to everything. The page itself is only cached for
+	@# five minutes, so moving the URL here reaches those clients on their next visit.
+	@v=$$(shasum -a 256 $(OUT) | cut -c1-12); \
+	  sed -i '' "s|data/valencia.json.gz|data/valencia.json.gz?v=$$v|" $(DIST)/index.html; \
+	  echo "artifact version: $$v"
 	@echo "dist ready: $$(du -sh $(DIST) | cut -f1)"
 
 deploy: dist
