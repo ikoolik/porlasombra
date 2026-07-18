@@ -84,7 +84,7 @@
     <button class="chevron" id="toggle" aria-label="Collapse panel" aria-expanded="true">▾</button>
   </div>
   <div id="body">
-  <p class="sub">Finds the <b>shadiest walking route</b> between two points in Valencia — including <b>which side of the street</b> to walk on. Building heights come from the <b>Spanish Cadastre</b>, streets from OpenStreetMap, both baked into one precomputed file. Shadows and routing run <b>entirely in your browser</b>. No API keys, no server.</p>
+  <p class="sub">Finds the <b>shadiest walking route</b> between two points in Valencia — including <b>which side of the street</b> to walk on. Building heights come from the <b>Spanish Cadastre</b>, streets from OpenStreetMap, and <b>street trees</b> from the Ajuntament de València's tree inventory — all baked into one precomputed file. Shadows and routing run <b>entirely in your browser</b>. No API keys, no server.</p>
 
   <label for="dt">Date & time</label>
   <div class="row">
@@ -1568,17 +1568,14 @@ updateAlphaLabel();
 
 // Load the precomputed city once, up front. Everything after this is local computation.
 setBusy(true);
-loadArtifact().then((g) => {
-  const c = g.meta.counts;
+loadArtifact().then(() => {
   // Shadows were opt-in behind a button only because drawing them was expensive. On the GPU path
   // they cost a fullscreen shader pass, so they are simply always on.
   if (shadowLayer.gpu) {
     document.getElementById("shadeBtn").style.display = "none";
     shadowLayer.redraw();
   }
-  setStatus(`Ready — ${c.nodes.toLocaleString()} sidewalk nodes, ` +
-            `${c.buildings.toLocaleString()} building parts (${g.meta.city}, ${g.meta.generated}). ` +
-            `Click the map to place A and B.`);
+  setStatus("Click the map to place A and B.");
   setBusy(false);
 }).catch((e) => {
   setStatus("⚠️ Could not load map data: " + e.message);
