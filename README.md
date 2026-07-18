@@ -20,9 +20,15 @@ Edge cost is:
 (length + crossing_penalty) × (1 + α × sun_exposure)
 ```
 
-where **α** is the shade-preference slider. At α = 0 you get the plain shortest path; at α = 1 a sunny metre costs the same as two shaded ones. It runs A\* twice — once at α = 0, once at your α — so you can see the trade-off.
+where **α** is fixed at 1.2 — a sunny metre costs a bit over twice a shaded one. The route you get is always the shadiest one; there is no dial to set and no second route to compare against.
 
 Because every edge costs at least its own length, straight-line distance to the target never overestimates the remaining cost, so A\* returns the exact optimum, not an approximation.
+
+### The screen
+
+One screen, one action. The map is the whole viewport; a search bar sits on top and becomes an A→B trip bar once you pick a destination; a day slider sits at the bottom. Drag the slider and the shadows sweep with it — on release the route is recomputed, because the shadiest path at 09:00 is a different path from the one at 17:00, and relabelling the old one would be a lie.
+
+The date is always today. Everything the screen is for is "now" or "in a few hours", and the engine still takes an arbitrary `Date` if that changes.
 
 ### Searching for a place
 

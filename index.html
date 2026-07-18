@@ -5,156 +5,183 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Shade Route — prototype</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" />
 <style>
-  :root { --panel: #ffffff; --ink: #1a1a1a; --muted: #666; --accent: #2f8f4e; --sun: #f4b400; }
+  /* Design tokens from the handoff. The app is one screen: a full-bleed map with two floating
+     overlay stacks, so everything here is either a token, a floating card, or map furniture. */
+  :root {
+    --ink:#16181d; --muted:#8b9198; --muted-2:#9aa0a8; --muted-3:#b3b8bf;
+    --chip:#f2f4f6; --tint:#eaf5ef; --hairline:#eef0f2;
+    --green:#1f9d57; --green-deep:#0f5a33; --donut:#4fd08a; --orange:#e0a43b;
+    --card:0 6px 20px rgba(20,24,29,.16);
+    --drop:0 10px 30px rgba(20,24,29,.2);
+    --dark:0 10px 30px rgba(20,24,29,.28);
+  }
   * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); }
-  #map { position: absolute; inset: 0; z-index: 0; }
-  #panel {
-    position: absolute; z-index: 1000; top: 12px; left: 12px; width: 340px; max-width: calc(100vw - 24px);
-    background: var(--panel); border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.18);
-    padding: 14px 16px; max-height: calc(100vh - 24px); overflow-y: auto;
-  }
+  [hidden] { display: none !important; }
+  html, body { margin:0; height:100%; font-family:"DM Sans", system-ui, -apple-system, sans-serif; color:var(--ink); }
+  #map { position:absolute; inset:0; z-index:0; background:#e7ebe6; }
+  .leaflet-container { font-family:"DM Sans", system-ui, sans-serif; }
 
-  /* Collapsing. The header stays put and carries the summary, so a collapsed panel still tells
-     you the answer while leaving the map visible — which is the whole point on a phone. */
-  .head { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
-  .head h1 { flex: 1; }
-  .chevron {
-    flex: 0 0 auto; width: 26px; height: 26px; margin: -3px -4px 0 0; padding: 0;
-    border: none; border-radius: 7px; background: #f0f0f0; color: #444;
-    font-size: 13px; line-height: 26px; text-align: center; cursor: pointer; transition: transform .18s;
-  }
-  #panel.collapsed .chevron { transform: rotate(-90deg); }
-  #panel.collapsed #body { display: none; }
-  #panel.collapsed { padding-bottom: 12px; }
-  /* Once a route exists the collapsed header shows its shade figure. */
-  #summary { display: none; font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
-  #panel.collapsed #summary.has-route { display: block; }
+  /* Overlay stacks. The design is drawn at 390 px; on a wide screen the bars would stretch to
+     something unusable, so they cap out and hug the left — the rail the handoff calls for. */
+  #top, #bottom { position:absolute; z-index:30; display:flex; flex-direction:column; width:100%; max-width:412px; }
+  #top { top:14px; left:14px; padding-right:28px; gap:9px; }
+  #bottom { left:0; bottom:0; padding:0 12px 12px; gap:10px; max-width:436px; }
+  @media (min-width: 760px) { #top { top:18px; } }
 
-  h1 { font-size: 16px; margin: 0 0 2px; }
-  .sub { font-size: 12px; color: var(--muted); margin: 0 0 12px; line-height: 1.4; }
-  label { font-size: 12px; font-weight: 600; display: block; margin: 10px 0 4px; }
-  input[type="datetime-local"], select { width: 100%; padding: 7px 8px; font-size: 13px; border: 1px solid #ddd; border-radius: 8px; }
-  input[type="range"] { width: 100%; }
-  .row { display: flex; gap: 8px; }
-  .row > * { flex: 1; }
-  button {
-    width: 100%; padding: 10px; font-size: 14px; font-weight: 600; color: #fff; background: var(--accent);
-    border: none; border-radius: 9px; cursor: pointer; margin-top: 12px;
-  }
-  button.secondary { background: #eee; color: #333; }
-  button:disabled { opacity: .5; cursor: default; }
-  .steps { font-size: 12px; color: var(--muted); margin: 10px 0 0; padding-left: 16px; line-height: 1.5; }
-  .badge { display: inline-block; width: 20px; height: 20px; border-radius: 50%; color:#fff; text-align:center; line-height:20px; font-size:12px; font-weight:700; }
-  .badge.a { background:#2b6cb0; } .badge.b { background:#c53030; }
-  .badge.sm { width: 15px; height: 15px; line-height: 15px; font-size: 10px; vertical-align: -2px; margin-right: 5px; }
+  .bar { background:#fff; border-radius:16px; box-shadow:var(--card); }
 
-  /* Geocoder. The suggestion list is absolutely positioned so it overlays what follows instead
-     of pushing the controls down — a panel that reflows on every keystroke is unusable. */
-  .geo { position: relative; }
-  .geo input { width: 100%; padding: 7px 26px 7px 8px; font-size: 13px; border: 1px solid #ddd; border-radius: 8px; }
-  .geo input:focus { outline: none; border-color: var(--accent); }
-  .geo .clear {
-    position: absolute; right: 4px; top: 4px; width: 22px; height: 22px; margin: 0; padding: 0;
-    border: none; border-radius: 6px; background: none; color: var(--muted);
-    font-size: 15px; line-height: 22px; cursor: pointer; display: none;
-  }
-  .geo.filled .clear { display: block; }
-  .geo .clear:hover { background: #f0f0f0; color: var(--ink); }
-  .sugg {
-    position: absolute; z-index: 1200; top: 100%; left: 0; right: 0; margin: 3px 0 0; padding: 4px;
-    list-style: none; background: #fff; border: 1px solid #ddd; border-radius: 9px;
-    box-shadow: 0 8px 22px rgba(0,0,0,.16); max-height: 232px; overflow-y: auto; display: none;
-  }
-  .sugg.open { display: block; }
-  .sugg li { padding: 6px 8px; border-radius: 6px; font-size: 13px; line-height: 1.35; cursor: pointer; }
-  .sugg li.sel { background: #f2fbf5; }
-  .sugg li .n { display: block; font-size: 11px; color: var(--muted); }
-  .sugg li.empty { color: var(--muted); cursor: default; }
-  #results { margin-top: 12px; font-size: 13px; }
-  .route-card { border:1px solid #eee; border-radius:9px; padding:8px 10px; margin-top:8px; }
-  .route-card.best { border-color: var(--accent); background: #f2fbf5; }
-  .route-card b { font-size: 14px; }
-  .bar { height:7px; border-radius:4px; background:#eee; margin-top:5px; overflow:hidden; }
-  .bar > i { display:block; height:100%; background:var(--accent); }
-  #status { font-size:12px; color: var(--muted); margin-top:10px; min-height: 16px; }
-  .colophon { margin-top: 12px; padding-top: 10px; border-top: 1px solid #f0f0f0; font-size: 11px; }
-  .colophon a { color: var(--muted); text-decoration: none; display: inline-flex; align-items: center; gap: 5px; }
-  .colophon a:hover { color: var(--ink); }
-  .colophon svg { flex: 0 0 auto; }
+  /* Search bar */
+  #searchBar { display:flex; align-items:center; gap:11px; padding:14px 16px; }
+  #searchBar .glyph { font:600 17px "DM Sans"; color:var(--green); }
+  #q { flex:1; min-width:0; border:none; outline:none; background:transparent; font:600 15px "DM Sans"; color:var(--ink); }
+  #q::placeholder { color:var(--muted-2); font-weight:600; }
+  #qClear { border:none; background:none; padding:0 2px; font:600 16px "DM Sans"; color:var(--muted-2); cursor:pointer; }
 
-  /* Phones: full width, anchored to the bottom so the controls sit under the thumb and the
-     collapsed panel is a slim bar rather than a sheet covering the map. */
-  @media (max-width: 640px) {
-    #panel {
-      top: auto; bottom: 8px; left: 8px; right: 8px; width: auto; max-width: none;
-      max-height: 70vh; border-radius: 14px;
-    }
-    .sub { display: none; }        /* the pitch is for desktop; on a phone it is just in the way */
-    .steps { display: none; }
+  /* Trip bar */
+  #tripBar { display:flex; align-items:center; gap:6px; padding:6px 8px; }
+  #tripBar .ends { flex:1; min-width:0; }
+  .end { display:flex; align-items:center; gap:11px; padding:10px 8px; cursor:pointer; border-radius:9px; }
+  .end:hover { background:#fafbfc; }
+  .end .dot { width:11px; height:11px; flex:0 0 auto; }
+  .end .dot.from { border-radius:50%; background:var(--green); }
+  .end .dot.to { border-radius:3px; background:var(--orange); }
+  .end .label { flex:1; min-width:0; font:600 14px "DM Sans"; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .end .label.empty { color:var(--muted-2); font-weight:500; }
+  #tripBar .divider { height:1px; background:var(--hairline); margin:0 8px 0 27px; }
+  #tripBar .acts { display:flex; flex-direction:column; gap:6px; flex:0 0 auto; padding-right:4px; }
+  #tripBar .acts button { width:34px; height:34px; border:none; border-radius:10px; background:var(--chip); color:#5b6168; font:600 15px "DM Sans"; cursor:pointer; }
+  #tripBar .acts button:hover { background:#e8ebee; }
+
+  /* Suggestions */
+  #sugg { list-style:none; margin:0; padding:6px; background:#fff; border-radius:16px; box-shadow:var(--drop); max-height:340px; overflow:auto; }
+  #sugg li { display:flex; align-items:center; gap:12px; padding:12px; border-radius:12px; cursor:pointer; }
+  #sugg li.sel, #sugg li:hover { background:var(--tint); }
+  #sugg li .tile { width:34px; height:34px; flex:0 0 auto; border-radius:10px; background:var(--tint); color:var(--green); display:flex; align-items:center; justify-content:center; font:600 15px "DM Sans"; }
+  #sugg li .txt { flex:1; min-width:0; }
+  #sugg li .name { font:600 14px "DM Sans"; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #sugg li .meta { font:500 12px "DM Sans"; color:var(--muted-2); }
+  #sugg li.empty { color:var(--muted-2); font:500 13px "DM Sans"; cursor:default; }
+  #sugg li.empty:hover { background:none; }
+
+  /* Status. The design has no status line, but shadow/routing work is slow enough to need one,
+     and an error that never appears is worse than a plain-looking pill. */
+  #toast { align-self:flex-start; max-width:100%; background:var(--ink); color:#fff; border-radius:999px;
+           padding:8px 14px; font:600 12px "DM Sans"; box-shadow:var(--dark); }
+
+  /* Route summary */
+  #routeCard { display:flex; align-items:center; gap:14px; background:var(--ink); color:#fff;
+               border-radius:20px; padding:15px 17px; box-shadow:var(--dark); transition:opacity .15s; }
+  #routeCard.pending { opacity:.55; }
+  #donut { width:52px; height:52px; flex:0 0 auto; border-radius:14px; display:flex; align-items:center; justify-content:center;
+           background:conic-gradient(var(--donut) 0deg, rgba(255,255,255,.14) 0); }
+  .donutInner { width:40px; height:40px; border-radius:11px; background:var(--ink); display:flex; align-items:center; justify-content:center; font:700 13px "DM Sans"; }
+  #routeCard .rmeta { flex:1; min-width:0; }
+  #routeCard .rtitle { font:700 16px "DM Sans"; }
+  #routeCard .rsub { font:500 13px "DM Sans"; color:#b9bec4; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #routeCard .rtitle { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #centerBtn { flex:0 0 auto; padding:11px 15px; border:none; border-radius:12px; background:var(--green); color:#fff; font:700 14px "DM Sans"; cursor:pointer; }
+  #centerBtn:hover { background:#1a8b4c; }
+
+  /* Time slider */
+  #timeCard { background:#fff; border-radius:22px; padding:15px 18px 17px; box-shadow:0 8px 26px rgba(20,24,29,.16); }
+  .thead { display:flex; align-items:center; justify-content:space-between; margin-bottom:13px; }
+  .tleft { display:flex; align-items:center; gap:9px; min-width:0; }
+  #sunGlyph { font-size:17px; }
+  #clock { font:700 16px "DM Sans"; }
+  #dayNote { font:500 13px "DM Sans"; color:var(--muted-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #nowBtn { flex:0 0 auto; border:none; border-radius:999px; padding:7px 13px; font:700 12px "DM Sans"; cursor:pointer;
+            background:var(--chip); color:var(--muted); }
+  #nowBtn.active { background:var(--tint); color:var(--green); }
+  input[type=range].sun {
+    -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:6px; outline:none;
+    background:linear-gradient(90deg,#2b3350 0%,#516091 14%,#f2d9a6 34%,#e0a43b 50%,#f2d9a6 66%,#516091 86%,#2b3350 100%);
   }
+  input[type=range].sun::-webkit-slider-thumb { -webkit-appearance:none; width:26px; height:26px; border-radius:50%; background:#fff; border:3px solid var(--orange); box-shadow:0 2px 8px rgba(20,24,29,.3); cursor:pointer; }
+  input[type=range].sun::-moz-range-thumb { width:26px; height:26px; border-radius:50%; background:#fff; border:3px solid var(--orange); box-shadow:0 2px 8px rgba(20,24,29,.3); cursor:pointer; }
+  .scale { display:flex; justify-content:space-between; margin-top:7px; font:500 11px "DM Sans"; color:var(--muted-3); }
+
+  /* Map furniture */
+  .pin { width:26px; height:26px; border-radius:50% 50% 50% 2px; transform:rotate(45deg); border:2px solid #fff;
+         box-shadow:0 2px 6px rgba(0,0,0,.4); display:flex; align-items:center; justify-content:center; }
+  .pin span { transform:rotate(-45deg); color:#fff; font:700 12px "DM Sans"; }
+  .leaflet-popup-content-wrapper { border-radius:16px; box-shadow:0 8px 24px rgba(20,24,29,.22); padding:0; }
+  .leaflet-popup-content { margin:0; }
+  .pop { padding:6px; min-width:184px; }
+  .pop .plabel { font:600 13px "DM Sans"; color:var(--ink); padding:6px 8px 10px; }
+  .pop .prow { display:flex; gap:7px; }
+  .pop button { flex:1; padding:10px 8px; border:none; border-radius:10px; color:#fff; font:700 12px "DM Sans"; cursor:pointer; }
+  .pop button.a { background:var(--green); }
+  .pop button.b { background:var(--orange); }
+
+  /* Attribution is an obligation (ODbL for the street network, CC BY for the trees), so it is
+     lifted clear of the bottom overlay rather than left underneath it. */
+  .leaflet-control-attribution { font:500 10px "DM Sans" !important; border-radius:8px 0 0 0; padding:3px 7px !important;
+    max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; background:rgba(255,255,255,.82) !important; }
+  .leaflet-control-attribution a { color:#4a5158; }
 </style>
 </head>
 <body>
 <div id="map"></div>
 
-<div id="panel">
-  <div class="head" id="head">
-    <div style="flex:1">
-      <h1>☀️ por la sombra</h1>
-      <div id="summary"></div>
+<!-- Top stack: the search bar, or the A/B trip bar once a destination exists. -->
+<div id="top">
+  <div class="bar" id="searchBar">
+    <span class="glyph">&#8981;</span>
+    <input id="q" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
+           placeholder="&iquest;A d&oacute;nde vas por la sombra?" />
+    <button id="qClear" aria-label="Borrar b&uacute;squeda" hidden>&#10005;</button>
+  </div>
+
+  <div class="bar" id="tripBar" hidden>
+    <div class="ends">
+      <div class="end" id="endFrom">
+        <span class="dot from"></span>
+        <div class="label" id="fromLabel">Tu ubicaci&oacute;n</div>
+      </div>
+      <div class="divider"></div>
+      <div class="end" id="endTo">
+        <span class="dot to"></span>
+        <div class="label" id="toLabel"></div>
+      </div>
     </div>
-    <button class="chevron" id="toggle" aria-label="Collapse panel" aria-expanded="true">▾</button>
-  </div>
-  <div id="body">
-  <p class="sub">Finds the <b>shadiest walking route</b> between two points in Valencia — including <b>which side of the street</b> to walk on. Building heights come from the <b>Spanish Cadastre</b>, streets from OpenStreetMap, and <b>street trees</b> from the Ajuntament de València's tree inventory — all baked into one precomputed file. Shadows and routing run <b>entirely in your browser</b>. No API keys, no server.</p>
-
-  <label for="fromQ"><span class="badge a sm">A</span>From</label>
-  <div class="geo" id="fromG">
-    <input id="fromQ" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
-           placeholder="Address or landmark, or click the map" />
-    <button class="clear" id="fromC" tabindex="-1" aria-label="Clear start">×</button>
-    <ul class="sugg" id="fromS" role="listbox"></ul>
+    <div class="acts">
+      <button id="swapBtn" title="Intercambiar" aria-label="Intercambiar origen y destino">&#8645;</button>
+      <button id="clearBtn" title="Borrar" aria-label="Borrar viaje">&#10005;</button>
+    </div>
   </div>
 
-  <label for="toQ"><span class="badge b sm">B</span>To</label>
-  <div class="geo" id="toG">
-    <input id="toQ" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
-           placeholder="Address or landmark, or click the map" />
-    <button class="clear" id="toC" tabindex="-1" aria-label="Clear destination">×</button>
-    <ul class="sugg" id="toS" role="listbox"></ul>
+  <ul id="sugg" role="listbox" hidden></ul>
+  <div id="toast" hidden></div>
+</div>
+
+<!-- Bottom stack: the route summary (once there is one) over the day slider. -->
+<div id="bottom">
+  <div id="routeCard" hidden>
+    <div id="donut"><div class="donutInner" id="donutPct">&mdash;</div></div>
+    <div class="rmeta">
+      <div class="rtitle">Ruta m&aacute;s sombreada</div>
+      <div class="rsub" id="routeMeta"></div>
+    </div>
+    <button id="centerBtn">Centrar</button>
   </div>
 
-  <label for="dt">Date & time</label>
-  <div class="row">
-    <input type="datetime-local" id="dt" />
-    <button class="secondary" id="nowBtn" style="margin-top:0;flex:0 0 64px;">Now</button>
+  <div id="timeCard">
+    <div class="thead">
+      <div class="tleft">
+        <span id="sunGlyph">&#9728;&#65039;</span>
+        <span id="clock">--:--</span>
+        <span id="dayNote"></span>
+      </div>
+      <button id="nowBtn" class="active">Ahora</button>
+    </div>
+    <input type="range" id="time" class="sun" min="0" max="1435" step="5" value="720"
+           aria-label="Hora del d&iacute;a" />
+    <div class="scale"><span>12 am</span><span>6 am</span><span>12 pm</span><span>6 pm</span><span>12 am</span></div>
   </div>
-
-  <label for="hour">Scrub time of day: <span id="hourLbl"></span></label>
-  <input type="range" id="hour" min="0" max="1439" step="5" />
-
-  <label for="alpha">Shade preference: <span id="alphaLbl"></span></label>
-  <input type="range" id="alpha" min="0" max="4" step="0.1" value="1.2" />
-
-  <ol class="steps">
-    <li>Search an address or landmark above, or click the map to drop <span class="badge a">A</span> (start) then <span class="badge b">B</span> (end). Markers are draggable.</li>
-    <li>Press <b>Find shady route</b>.</li>
-  </ol>
-
-  <button id="findBtn" disabled>Find shady route</button>
-  <button class="secondary" id="shadeBtn">Show shadows only (current view)</button>
-
-  <div id="results"></div>
-  <div id="status"></div>
-  <div class="colophon">
-    <a href="https://github.com/ikoolik/porlasombra" target="_blank" rel="noopener noreferrer">
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-      Source on GitHub
-    </a>
-  </div>
-  </div><!-- /#body -->
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -190,16 +217,17 @@ function leafFraction(date) {
 let G = null;
 
 // ---------- Map ----------
-const map = L.map("map").setView(VALENCIA, 16);
+const map = L.map("map", { zoomControl: false }).setView(VALENCIA, 16);
 // Attribution covers every use, not just the tiles: the street network and the sidewalk graph
 // derived from it are OSM (ODbL requires crediting a derived database), every building footprint
 // and height comes from the Spanish Cadastre, and the canopy is the Ajuntament's tree inventory,
 // whose CC BY 4.0 makes this line an obligation rather than a courtesy.
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
-  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · ' +
-               'buildings © <a href="https://www.catastro.hacienda.gob.es/">Dirección General del Catastro</a> · ' +
-               'trees © <a href="https://geoportal.valencia.es/">Ajuntament de València</a>',
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · ' +
+               '<a href="https://www.catastro.hacienda.gob.es/">Catastro</a> · ' +
+               '<a href="https://geoportal.valencia.es/">Ajuntament de València</a> · ' +
+               '<a href="https://github.com/ikoolik/porlasombra">código</a>',
 }).addTo(map);
 
 // ---------- Shadow rendering ----------
@@ -796,36 +824,46 @@ const shadowLayer = makeShadowLayer().addTo(map);
 const routeLayer = L.featureGroup().addTo(map); // featureGroup for .getBounds()
 let markerA = null, markerB = null;
 
-// ---------- Time controls ----------
-const dt = document.getElementById("dt");
-const hour = document.getElementById("hour");
-const hourLbl = document.getElementById("hourLbl");
-const alpha = document.getElementById("alpha");
-const alphaLbl = document.getElementById("alphaLbl");
+// ---------- Time ----------
+// One control: the time of day, always today. Every use case the design targets is "now" or
+// "in a few hours", and the date picker was most of what made the old panel a form. The engine
+// still takes an arbitrary Date, so a date control is a small addition if that changes.
+const SHADE_ALPHA = 1.2;   // the old slider's default; the route shown is always the shadiest
+const timeEl = document.getElementById("time");
+const nowBtn = document.getElementById("nowBtn");
+let timeMin = 12 * 60;
+let isNow = true;
 
+function currentDate() {
+  const d = new Date();
+  d.setHours(Math.floor(timeMin / 60), timeMin % 60, 0, 0);
+  return d;
+}
+// Cache key for the shade index. Dated rather than just the minute, so a session left open
+// across midnight recomputes instead of reusing yesterday's sun.
+const timeKey = () => currentDate().toISOString().slice(0, 16);
+
+function setTime(min, now) {
+  timeMin = Math.max(0, Math.min(1435, Math.round(min)));
+  isNow = !!now;
+  timeEl.value = timeMin;
+  renderTime();
+}
 function setNow() {
   const n = new Date();
-  const iso = new Date(n.getTime() - n.getTimezoneOffset()*60000).toISOString().slice(0,16);
-  dt.value = iso;
-  syncHourFromDt();
+  setTime(n.getHours() * 60 + n.getMinutes(), true);
 }
-function syncHourFromDt() {
-  const d = new Date(dt.value);
-  hour.value = d.getHours()*60 + d.getMinutes();
-  updateHourLabel();
-}
-function updateHourLabel() {
-  const m = +hour.value; const h = Math.floor(m/60), mm = m%60;
-  hourLbl.textContent = String(h).padStart(2,"0")+":"+String(mm).padStart(2,"0");
-}
-function updateAlphaLabel() {
-  const a = +alpha.value;
-  const how = a === 0 ? "ignore shade (shortest)" : a < 0.7 ? "slight" : a < 1.8 ? "balanced" : a < 3 ? "strong" : "shade at almost any cost";
-  alphaLbl.textContent = `${a.toFixed(1)} — ${how}`;
-}
-function currentDate() { return new Date(dt.value); }
 
-document.getElementById("nowBtn").onclick = setNow;
+function renderTime() {
+  const h = timeMin / 60;
+  document.getElementById("clock").textContent =
+    String(Math.floor(timeMin / 60)).padStart(2, "0") + ":" + String(timeMin % 60).padStart(2, "0");
+  document.getElementById("sunGlyph").textContent = (h < 7 || h > 20) ? "\u{1F319}" : (h < 9 || h > 18) ? "\u{1F307}" : "\u2600\uFE0F";
+  document.getElementById("dayNote").textContent =
+    (h >= 12 && h < 17) ? "sol alto \u00b7 poca sombra" : (h < 8 || h > 19) ? "sol bajo \u00b7 mucha sombra" : "sol moderado";
+  nowBtn.classList.toggle("active", isNow);
+}
+
 // On the GPU path a time change is one fullscreen shader pass over an unchanged height field —
 // no CPU work at all — so the slider redraws on every `input` and the shadows sweep with the
 // handle. The 2D fallback still has to rebuild a few thousand convex hulls, so it stays coalesced.
@@ -840,15 +878,13 @@ function redrawShadows() {
     renderShadows([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], true);
   }, 120);
 }
-dt.onchange = () => { syncHourFromDt(); redrawShadows(); };
-hour.oninput = () => {
-  updateHourLabel();
-  const d = new Date(dt.value);
-  d.setHours(Math.floor(hour.value/60), hour.value%60, 0, 0);
-  dt.value = new Date(d.getTime() - d.getTimezoneOffset()*60000).toISOString().slice(0,16);
-  redrawShadows();
-};
-alpha.oninput = updateAlphaLabel;
+
+nowBtn.onclick = () => { setNow(); onTimeSettled(); };
+// Dragging is cheap (shadows only). Re-routing is not — a corridor's shadows plus two A* passes
+// is seconds, not frames — so the route follows on release. The shadiest path genuinely changes
+// with the sun, so the alternative is showing a route labelled "shadiest" that no longer is.
+timeEl.oninput = () => { setTime(+timeEl.value, false); redrawShadows(); markStale(); };
+timeEl.onchange = onTimeSettled;
 
 // ---------- Geometry helpers ----------
 // Convex hull (monotone chain) over [lng,lat] points. Replaces turf.convex: the shadow pass
@@ -1088,7 +1124,7 @@ let lastShadows = null;
 let lastCanopy = null;
 
 async function loadArtifact() {
-  setStatus("Loading Valencia map data…");
+  toast("Cargando los datos de València…", true);
   const res = await fetch(ARTIFACT_URL);
   if (!res.ok) throw new Error(`artifact ${res.status} — run \`make -C build\` first`);
   // Whether we have to gunzip depends on the host, so sniff rather than assume. A plain static
@@ -1557,7 +1593,7 @@ const bboxOf = (...lls) => {
 // polygon index the router queries; drawing is the shadow layer's own business.
 function renderShadows(bbox, draw) {
   const sun = SunCalc.getPosition(currentDate(), ...VALENCIA);
-  computeShade(bbox, sun, dt.value);
+  computeShade(bbox, sun, timeKey());
   if (draw) drawShadows(sun);
   return sun;
 }
@@ -1622,255 +1658,300 @@ function ellipsePolygon(el) {
   return ring;
 }
 
-function drawPath(result, color, weight, dash) {
-  for (const seg of result.segs) {
-    const c1 = coordOf(seg.from), c2 = coordOf(seg.to);
-    const lit = seg.sun > 0.5;
-    L.polyline([[c1[1],c1[0]],[c2[1],c2[0]]],
-      { color: dash ? color : (lit ? "#f4b400" : color), weight, opacity: dash ? 0.6 : 0.95, dashArray: dash }).addTo(routeLayer);
+// The route reads as one green line with its sun-exposed stretches in orange, over a dark
+// casing so it stays legible against both the pale streets and the shadow wash.
+function drawRoute(r) {
+  const pts = r.segs.map((sg) => coordOf(sg.from));
+  pts.push(coordOf(r.segs[r.segs.length - 1].to));
+  L.polyline(pts.map((c) => [c[1], c[0]]),
+    { color: "#0f5a33", weight: 9, opacity: 0.35, lineCap: "round", lineJoin: "round" }).addTo(routeLayer);
+  for (const sg of r.segs) {
+    const c1 = coordOf(sg.from), c2 = coordOf(sg.to);
+    L.polyline([[c1[1], c1[0]], [c2[1], c2[0]]],
+      { color: sg.sun > 0.5 ? "#e0a43b" : "#1f9d57", weight: 6, opacity: 1, lineCap: "round", lineJoin: "round" })
+      .addTo(routeLayer);
   }
 }
 
-function card(title, r, best) {
-  const km = (r.length/1000).toFixed(2), min = Math.round(r.length/1.35/60), pct = Math.round(r.shadePct*100);
-  return `<div class="route-card ${best ? "best" : ""}">
-    <b>${title}</b> — ${pct}% in shade
-    <div style="color:#666">${km} km · ~${min} min walk</div>
-    <div class="bar"><i style="width:${pct}%"></i></div></div>`;
-}
+// ---------- Trip state ----------
+let from = null, to = null;      // { label, latlng }
+let searchTarget = "to";         // which end the search bar is editing
+let routing = false;
 
-// ---------- Main flow ----------
-async function findRoute() {
-  if (!markerA || !markerB || !G) return;
-  setBusy(true); routeLayer.clearLayers(); document.getElementById("results").innerHTML = "";
-  try {
-    const a = markerA.getLatLng(), b = markerB.getLatLng();
-    setStatus("Computing shadows…");
-    await new Promise(r => setTimeout(r, 0));
-    const sun = renderShadows(bboxOf(a, b), false); // drawn below, once the map has settled
+const els = {
+  top: document.getElementById("top"),
+  bottom: document.getElementById("bottom"),
+  searchBar: document.getElementById("searchBar"),
+  tripBar: document.getElementById("tripBar"),
+  q: document.getElementById("q"),
+  qClear: document.getElementById("qClear"),
+  sugg: document.getElementById("sugg"),
+  toast: document.getElementById("toast"),
+  routeCard: document.getElementById("routeCard"),
+  donut: document.getElementById("donut"),
+  donutPct: document.getElementById("donutPct"),
+  routeMeta: document.getElementById("routeMeta"),
+  fromLabel: document.getElementById("fromLabel"),
+  toLabel: document.getElementById("toLabel"),
+};
 
-    const src = nearestNode(a), dst = nearestNode(b);
-    if (src < 0 || dst < 0) throw new Error("That point is outside the Valencia map data");
-    setStatus("Routing…");
-    await new Promise(r => setTimeout(r, 0));
-
-    const shortest = dijkstra(src, dst, 0, sun.altitude);
-    const shady = dijkstra(src, dst, +alpha.value, sun.altitude);
-    if (!shortest || !shady) throw new Error("No route found — try points closer to a street");
-
-    const same = shady.length === shortest.length && Math.abs(shady.shadePct - shortest.shadePct) < 1e-9;
-    if (!same) drawPath(shortest, "#888", 4, "6 6");
-    drawPath(shady, "#2f8f4e", 6, null);
-
-    document.getElementById("results").innerHTML =
-      card("🌳 Shadiest", shady, true) + (same ? "" : card("Shortest", shortest, false));
-
-    // Carry the answer into the header, then get out of the way on a phone — you asked for a
-    // route because you want to look at the map, not at the form that produced it.
-    summaryEl.textContent =
-      `${Math.round(shady.shadePct*100)}% in shade · ${(shady.length/1000).toFixed(2)} km · ~${Math.round(shady.length/1.35/60)} min`;
-    summaryEl.classList.add("has-route");
-    if (isPhone()) setCollapsed(true);
-    layoutAttribution();   // the summary line makes the collapsed bar a line taller
-
-    map.fitBounds(routeLayer.getBounds(), { padding: [40,40] });
-    drawShadows(sun);
-    const extra = Math.round(shady.length - shortest.length);
-    setStatus(sun.altitude <= 0.03
-      ? "🌙 Sun is below the horizon — everything counts as shade."
-      : same
-      ? `The shortest route is already the shadiest — ${Math.round(shady.shadePct*100)}% shaded.`
-      : `Shadiest route is ${Math.round(shady.shadePct*100)}% shaded vs ${Math.round(shortest.shadePct*100)}% for the shortest, for ${extra} m extra.`);
-  } catch (e) {
-    setStatus("⚠️ " + e.message + ".");
-  } finally { setBusy(false); }
-}
-
-async function showShadowsOnly() {
-  if (!G) return;
-  setBusy(true);
-  try {
-    const bnds = map.getBounds();
-    setStatus("Computing shadows for this view…");
-    await new Promise(r => setTimeout(r, 0));
-    const sun = renderShadows([bnds.getWest(), bnds.getSouth(), bnds.getEast(), bnds.getNorth()], true);
-    setStatus(sun.altitude <= 0.03
-      ? "🌙 Sun is below the horizon at this time — everything counts as shade."
-      : `☀️ Sun altitude ${(sun.altitude*180/Math.PI).toFixed(0)}° — shadows drawn for this view.`);
-  } catch (e) { setStatus("⚠️ " + e.message); }
-  finally { setBusy(false); }
-}
-
-// ---------- Panel ----------
-const panel = document.getElementById("panel");
-const summaryEl = document.getElementById("summary");
-const toggleBtn = document.getElementById("toggle");
-const isPhone = () => window.matchMedia("(max-width: 640px)").matches;
-
-// On a phone the panel sits over the bottom-right attribution. Licence terms require that stay
-// visible, so lift it clear of the collapsed bar — measured, not guessed, since the bar grows a
-// line taller once it carries a route summary.
-function layoutAttribution() {
-  const el = document.querySelector(".leaflet-bottom.leaflet-right");
-  if (!el) return;
-  const collapsed = panel.classList.contains("collapsed");
-  el.style.bottom = (isPhone() && collapsed)
-    ? Math.round(panel.getBoundingClientRect().height) + 14 + "px"
-    : "";
-}
-
-function setCollapsed(on) {
-  panel.classList.toggle("collapsed", on);
-  toggleBtn.setAttribute("aria-expanded", String(!on));
-  toggleBtn.setAttribute("aria-label", on ? "Expand panel" : "Collapse panel");
+let toastTimer = null;
+function toast(msg, sticky) {
+  clearTimeout(toastTimer);
+  if (!msg) { els.toast.hidden = true; return; }
+  els.toast.textContent = msg;
+  els.toast.hidden = false;
   layoutAttribution();
+  if (!sticky) toastTimer = setTimeout(() => { els.toast.hidden = true; }, 5000);
 }
-window.addEventListener("resize", layoutAttribution);
-// The whole header is the hit target — a 26 px chevron is a poor one on a phone.
-document.getElementById("head").onclick = () => setCollapsed(!panel.classList.contains("collapsed"));
 
-// Start collapsed on a phone: the map is the thing worth seeing first.
-if (isPhone()) setCollapsed(true);
-
-// ---------- UI plumbing ----------
-function setStatus(t) { document.getElementById("status").textContent = t; }
-function setBusy(b) { document.getElementById("findBtn").disabled = b || !(markerA && markerB); document.getElementById("shadeBtn").disabled = b; }
-
-function makeMarker(latlng, kind) {
-  const m = L.marker(latlng, { draggable: true, title: kind }).addTo(map);
-  m.bindTooltip(kind, { permanent: true, direction: "top", offset: [-15, -10] });
-  // A dragged marker no longer stands at the address the box names, so the box says where it is.
-  m.on("dragend", () => setField(kind, coordLabel(m.getLatLng())));
-  return m;
-}
-map.on("click", (e) => {
-  if (!markerA) { markerA = makeMarker(e.latlng, "A"); setField("A", coordLabel(e.latlng)); }
-  else if (!markerB) { markerB = makeMarker(e.latlng, "B"); setField("B", coordLabel(e.latlng)); }
-  else {
-    markerA.setLatLng(e.latlng); setField("A", coordLabel(e.latlng));
-    if (markerB) map.removeLayer(markerB);
-    markerB = null; setField("B", "");
-  }
-  setBusy(false);
-});
-
-// ---------- search boxes ----------
+const fmtKm = (m) => m < 1000 ? Math.round(m) + " m" : (m / 1000).toFixed(2).replace(".", ",") + " km";
 const coordLabel = (ll) => `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
 
-function setField(kind, text) {
-  const input = document.getElementById(kind === "A" ? "fromQ" : "toQ");
-  input.value = text;
-  input.closest(".geo").classList.toggle("filled", !!text);
+// ---------- Markers ----------
+function pinIcon(letter, bg) {
+  return L.divIcon({ className: "", iconSize: [26, 26], iconAnchor: [13, 13],
+    html: `<div class="pin" style="background:${bg}"><span>${letter}</span></div>` });
+}
+function ensureMarker(kind, ll) {
+  const isA = kind === "from";
+  let m = isA ? markerA : markerB;
+  if (m) { m.setLatLng(ll); return m; }
+  m = L.marker(ll, { draggable: true, icon: pinIcon(isA ? "A" : "B", isA ? "#1f9d57" : "#e0a43b") }).addTo(map);
+  m.on("dragend", () => {
+    const p = m.getLatLng();
+    const cur = isA ? from : to;
+    setPoint(kind, p, cur && cur.pinned ? cur.label : "Punto en el mapa", false);
+  });
+  if (isA) markerA = m; else markerB = m;
+  return m;
 }
 
-// Place a marker from a search result, rather than from a click on the map.
-function setPoint(kind, lat, lon, label) {
-  const ll = L.latLng(lat, lon);
-  if (kind === "A") {
-    if (markerA) markerA.setLatLng(ll); else markerA = makeMarker(ll, "A");
+// `pinned` marks a label that came from a real place rather than from coordinates, so dragging
+// a searched destination a few metres does not keep claiming it is still that address.
+function setPoint(kind, latlng, label, fit) {
+  const ll = L.latLng(latlng);
+  ensureMarker(kind, ll);
+  const entry = { label, latlng: ll, pinned: false };
+  if (kind === "from") from = entry; else to = entry;
+  // Whatever the search bar was open to ask has just been answered — by a map tap, a drag or a
+  // suggestion. Leaving it open stacks it on top of the trip bar showing the same thing.
+  if (searchTarget === kind) searchTarget = null;
+  renderTrip();
+  if (from && to) route(fit !== false);
+  else if (kind === "to") map.setView(ll, Math.max(map.getZoom(), 16));
+}
+
+function clearPoint(kind) {
+  if (kind === "from") { if (markerA) map.removeLayer(markerA); markerA = null; from = null; }
+  else { if (markerB) map.removeLayer(markerB); markerB = null; to = null; }
+  routeLayer.clearLayers();
+  els.routeCard.hidden = true;
+  renderTrip();
+}
+
+// ---------- Chrome ----------
+function renderTrip() {
+  const searching = !to || searchTarget !== null;
+  els.tripBar.hidden = !to;
+  els.searchBar.hidden = !!to && searchTarget === null;
+  els.fromLabel.textContent = from ? from.label : "Elige el punto de partida";
+  els.fromLabel.classList.toggle("empty", !from);
+  els.toLabel.textContent = to ? to.label : "";
+  els.q.placeholder = searchTarget === "from"
+    ? "¿Desde dónde sales?" : "¿A dónde vas por la sombra?";
+  els.qClear.hidden = !els.q.value;
+  layoutAttribution();
+}
+
+function markStale() {
+  if (!els.routeCard.hidden) els.routeCard.classList.add("pending");
+}
+
+function showRoute(r, sun) {
+  const pct = Math.round(r.shadePct * 100);
+  const min = Math.max(1, Math.round(r.length / 1.35 / 60));
+  els.donut.style.background = `conic-gradient(var(--donut) ${(pct * 3.6).toFixed(0)}deg, rgba(255,255,255,.14) 0)`;
+  els.donutPct.textContent = pct + "%";
+  // The donut already carries the percentage, so the meta line does not repeat it — spelling it
+  // out a second time wrapped the card onto two lines at phone width for no added information.
+  els.routeMeta.textContent = `${fmtKm(r.length)} · ~${min} min a pie`;
+  els.routeCard.hidden = false;
+  els.routeCard.classList.remove("pending");
+  layoutAttribution();
+}
+
+// Padding so fitBounds never tucks the route under a floating card.
+const fitPad = () => ({
+  paddingTopLeft: [28, els.top.offsetHeight + 24],
+  paddingBottomRight: [28, els.bottom.offsetHeight + 24],
+});
+
+// ---------- Routing ----------
+async function route(fit) {
+  if (!from || !to || !G || routing) return;
+  routing = true;
+  markStale();
+  try {
+    toast("Calculando sombras…", true);
+    await new Promise((r) => setTimeout(r, 0));
+    const sun = renderShadows(bboxOf(from.latlng, to.latlng), false);
+
+    const src = nearestNode(from.latlng), dst = nearestNode(to.latlng);
+    if (src < 0 || dst < 0) throw new Error("Ese punto está fuera del mapa de València");
+    toast("Buscando la ruta…", true);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const r = dijkstra(src, dst, SHADE_ALPHA, sun.altitude);
+    if (!r) throw new Error("No hay ruta — prueba con puntos más cerca de una calle");
+
+    routeLayer.clearLayers();
+    drawRoute(r);
+    showRoute(r, sun);
+    if (fit) map.fitBounds(routeLayer.getBounds(), fitPad());
+    drawShadows(sun);
+    toast(sun.altitude <= 0.03 ? "\u{1F319} El sol está bajo el horizonte — todo cuenta como sombra." : "");
+  } catch (e) {
+    els.routeCard.classList.remove("pending");
+    toast("⚠️ " + e.message, true);
+  } finally { routing = false; }
+}
+
+// The slider moved and settled: the shadiest route for the new sun is a different route, so it
+// is recomputed rather than relabelled.
+function onTimeSettled() {
+  redrawShadows();
+  if (from && to) route(false);
+}
+
+// ---------- Search ----------
+let results = [], sel = -1;
+
+function closeSugg() { els.sugg.hidden = true; els.sugg.innerHTML = ""; results = []; sel = -1; layoutAttribution(); }
+
+function renderSugg() {
+  els.sugg.innerHTML = "";
+  if (!results.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Sin resultados en València";
+    els.sugg.appendChild(li);
   } else {
-    if (markerB) markerB.setLatLng(ll); else markerB = makeMarker(ll, "B");
-  }
-  setField(kind, label);
-  // Show the point without zooming out of a closer view the user chose deliberately.
-  if (markerA && markerB) map.fitBounds(L.latLngBounds(markerA.getLatLng(), markerB.getLatLng()), { padding: [60, 60] });
-  else map.setView(ll, Math.max(map.getZoom(), 16));
-  setBusy(false);
-}
-
-function setupSearch(kind) {
-  const p = kind === "A" ? "from" : "to";
-  const input = document.getElementById(p + "Q");
-  const list = document.getElementById(p + "S");
-  const wrap = document.getElementById(p + "G");
-  let results = [], sel = -1;
-
-  const close = () => { list.classList.remove("open"); list.innerHTML = ""; results = []; sel = -1; };
-
-  const render = () => {
-    list.innerHTML = "";
-    if (!results.length) {
-      // Say so explicitly: a list that just fails to appear reads as a broken box.
+    results.forEach((r, i) => {
       const li = document.createElement("li");
-      li.className = "empty";
-      li.textContent = "No match in Valencia";
-      list.appendChild(li);
-    } else {
-      results.forEach((r, i) => {
-        const li = document.createElement("li");
-        li.className = i === sel ? "sel" : "";
-        li.setAttribute("role", "option");
-        li.textContent = r.label;
-        if (r.hint) {
-          const s = document.createElement("span");
-          s.className = "n"; s.textContent = r.hint;
-          li.appendChild(s);
-        }
-        // mousedown, not click: blur would tear the list down before a click ever lands.
-        li.addEventListener("mousedown", (e) => { e.preventDefault(); choose(i); });
-        list.appendChild(li);
-      });
-    }
-    list.classList.add("open");
-  };
-
-  const choose = (i) => {
-    const r = results[i];
-    if (!r) return;
-    close();
-    setPoint(kind, r.lat, r.lon, r.label);
-  };
-
-  input.addEventListener("input", () => {
-    wrap.classList.toggle("filled", !!input.value);
-    const q = input.value;
-    if (q.trim().length < 2) { close(); return; }
-    results = geoSearch(q);
-    sel = -1;
-    render();
-  });
-
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { close(); return; }
-    if (!list.classList.contains("open") || !results.length) {
-      if (e.key === "Enter") e.preventDefault();
-      return;
-    }
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      const dir = e.key === "ArrowDown" ? 1 : -1;
-      // From nothing highlighted, Down takes the first and Up wraps to the last.
-      sel = sel < 0 ? (dir > 0 ? 0 : results.length - 1)
-                    : (sel + dir + results.length) % results.length;
-      render();
-      const el = list.children[sel];
-      if (el) el.scrollIntoView({ block: "nearest" });
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      choose(sel < 0 ? 0 : sel); // Enter with nothing highlighted takes the best match
-    }
-  });
-
-  input.addEventListener("focus", () => { if (results.length) render(); });
-  input.addEventListener("blur", () => setTimeout(close, 120));
-
-  document.getElementById(p + "C").addEventListener("click", () => {
-    setField(kind, "");
-    close();
-    const m = kind === "A" ? markerA : markerB;
-    if (m) map.removeLayer(m);
-    if (kind === "A") markerA = null; else markerB = null;
-    setBusy(false);
-    input.focus();
-  });
+      li.className = i === sel ? "sel" : "";
+      li.setAttribute("role", "option");
+      li.innerHTML = `<span class="tile">◈</span><span class="txt"><span class="name"></span><span class="meta"></span></span>`;
+      li.querySelector(".name").textContent = r.label;
+      li.querySelector(".meta").textContent = r.hint || "";
+      // mousedown, not click: blur would tear the list down before a click ever landed.
+      li.addEventListener("mousedown", (e) => { e.preventDefault(); pick(i); });
+      els.sugg.appendChild(li);
+    });
+  }
+  els.sugg.hidden = false;
+  layoutAttribution();
 }
-setupSearch("A");
-setupSearch("B");
-document.getElementById("findBtn").onclick = findRoute;
-document.getElementById("shadeBtn").onclick = showShadowsOnly;
 
-// The GPU layer follows the map on `move` by itself. The 2D fallback has to rebuild shadow
-// polygons for fresh territory, which is expensive enough to keep debounced until the map settles.
+function pick(i) {
+  const r = results[i];
+  if (!r) return;
+  const target = searchTarget || "to";
+  els.q.blur();
+  closeSugg();
+  els.q.value = "";
+  els.qClear.hidden = true;
+  searchTarget = null;
+  setPoint(target, [r.lat, r.lon], r.label, true);
+  const entry = target === "from" ? from : to;
+  if (entry) entry.pinned = true;
+  renderTrip();
+}
+
+els.q.addEventListener("input", () => {
+  els.qClear.hidden = !els.q.value;
+  if (els.q.value.trim().length < 2) { closeSugg(); return; }
+  results = geoSearch(els.q.value);
+  sel = -1;
+  renderSugg();
+});
+els.q.addEventListener("focus", () => { if (results.length) renderSugg(); });
+els.q.addEventListener("blur", () => setTimeout(() => {
+  if (els.sugg.hidden) return;
+  closeSugg();
+  // Opened only to edit an existing trip, then abandoned: put the trip bar back.
+  if (to && searchTarget !== null) { searchTarget = null; renderTrip(); }
+}, 140));
+els.q.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { els.q.blur(); return; }
+  if (els.sugg.hidden || !results.length) { if (e.key === "Enter") e.preventDefault(); return; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    const dir = e.key === "ArrowDown" ? 1 : -1;
+    sel = sel < 0 ? (dir > 0 ? 0 : results.length - 1) : (sel + dir + results.length) % results.length;
+    renderSugg();
+    const el = els.sugg.children[sel];
+    if (el) el.scrollIntoView({ block: "nearest" });
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    pick(sel < 0 ? 0 : sel);
+  }
+});
+els.qClear.addEventListener("click", () => {
+  els.q.value = "";
+  els.qClear.hidden = true;
+  closeSugg();
+  els.q.focus();
+});
+
+// Tapping either end of the trip bar reopens the search against that end.
+const openSearchFor = (kind) => {
+  searchTarget = kind;
+  renderTrip();
+  els.q.value = "";
+  els.qClear.hidden = true;
+  els.q.focus();
+};
+document.getElementById("endFrom").onclick = () => openSearchFor("from");
+document.getElementById("endTo").onclick = () => openSearchFor("to");
+
+document.getElementById("swapBtn").onclick = (e) => {
+  e.stopPropagation();
+  if (!from || !to) return;
+  const a = from, b = to;
+  from = { ...b }; to = { ...a };
+  ensureMarker("from", from.latlng);
+  ensureMarker("to", to.latlng);
+  renderTrip();
+  route(true);
+};
+document.getElementById("clearBtn").onclick = (e) => {
+  e.stopPropagation();
+  clearPoint("to");
+  searchTarget = "to";
+  els.q.value = "";
+  els.qClear.hidden = true;
+  closeSugg();
+  renderTrip();
+};
+document.getElementById("centerBtn").onclick = () => {
+  if (routeLayer.getLayers().length) map.fitBounds(routeLayer.getBounds(), fitPad());
+};
+
+// ---------- Map interaction ----------
+map.on("click", (e) => {
+  const wrap = document.createElement("div");
+  wrap.className = "pop";
+  wrap.innerHTML = `<div class="plabel">Punto seleccionado</div>
+    <div class="prow"><button class="a">Desde aquí</button><button class="b">Hasta aquí</button></div>`;
+  const set = (kind) => { map.closePopup(); setPoint(kind, e.latlng, "Punto en el mapa", true); };
+  wrap.querySelector("button.a").onclick = () => set("from");
+  wrap.querySelector("button.b").onclick = () => set("to");
+  L.popup({ closeButton: false, offset: [0, 4] }).setLatLng(e.latlng).setContent(wrap).openOn(map);
+});
+
+// The 2D fallback rebuilds shadow polygons for fresh territory, which is expensive enough to
+// keep debounced until the map settles. The GPU layer follows `move` by itself.
 if (!shadowLayer.gpu) {
   let moveTimer = null;
   map.on("moveend zoomend", () => {
@@ -1883,25 +1964,50 @@ if (!shadowLayer.gpu) {
   });
 }
 
-setNow();
-updateAlphaLabel();
+// ---------- Layout ----------
+// Attribution rides above the bottom stack. It is a licence condition, not decoration, so it
+// must never end up under a card.
+function layoutAttribution() {
+  const el = document.querySelector(".leaflet-control-attribution");
+  if (!el) return;
+  // Only lift it where the cards actually reach across the bottom of the screen. On a wide
+  // screen they are a left rail and the attribution keeps its corner.
+  const overlaps = els.bottom.getBoundingClientRect().right > window.innerWidth - 260;
+  el.style.bottom = overlaps ? (els.bottom.offsetHeight + 6) + "px" : "0px";
+}
+window.addEventListener("resize", layoutAttribution);
 
-// Load the precomputed city once, up front. Everything after this is local computation.
-setBusy(true);
+// ---------- Start ----------
+// Geolocation is a convenience, never a requirement: denied, unavailable, or simply somewhere
+// other than Valencia all land in the same place — pick a start yourself.
+function locateOrigin() {
+  if (!navigator.geolocation || from) return;
+  navigator.geolocation.getCurrentPosition((pos) => {
+    if (from) return;
+    const ll = L.latLng(pos.coords.latitude, pos.coords.longitude);
+    const bb = G && G.meta && G.meta.bbox;   // [s,w,n,e]
+    if (bb && (ll.lat < bb[0] || ll.lat > bb[2] || ll.lng < bb[1] || ll.lng > bb[3])) return;
+    setPoint("from", ll, "Tu ubicación", false);
+    map.setView(ll, 16);
+  }, () => {}, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
+}
+
+setNow();
+renderTrip();
+
 loadArtifact().then(() => {
-  // Shadows were opt-in behind a button only because drawing them was expensive. On the GPU path
-  // they cost a fullscreen shader pass, so they are simply always on.
-  if (shadowLayer.gpu) {
-    document.getElementById("shadeBtn").style.display = "none";
-    shadowLayer.redraw();
+  toast("");
+  // On the GPU path shade costs a fullscreen shader pass, so it is simply always on. The 2D
+  // fallback needs one explicit first draw before its moveend handler takes over.
+  if (shadowLayer.gpu) shadowLayer.redraw();
+  else {
+    const b = map.getBounds();
+    renderShadows([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()], true);
   }
-  setStatus(`Search an address or landmark, or click the map. ` +
-            `${G.geo.names.length.toLocaleString()} streets and ` +
-            `${G.geo.pName.length.toLocaleString()} landmarks loaded.`);
-  setBusy(false);
+  layoutAttribution();
+  locateOrigin();
 }).catch((e) => {
-  setStatus("⚠️ Could not load map data: " + e.message);
-  setBusy(false);
+  toast("⚠️ No se han podido cargar los datos: " + e.message, true);
 });
 </script>
 </body>
