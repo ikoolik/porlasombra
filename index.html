@@ -15,6 +15,23 @@
     background: var(--panel); border-radius: 12px; box-shadow: 0 6px 24px rgba(0,0,0,.18);
     padding: 14px 16px; max-height: calc(100vh - 24px); overflow-y: auto;
   }
+
+  /* Collapsing. The header stays put and carries the summary, so a collapsed panel still tells
+     you the answer while leaving the map visible — which is the whole point on a phone. */
+  .head { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+  .head h1 { flex: 1; }
+  .chevron {
+    flex: 0 0 auto; width: 26px; height: 26px; margin: -3px -4px 0 0; padding: 0;
+    border: none; border-radius: 7px; background: #f0f0f0; color: #444;
+    font-size: 13px; line-height: 26px; text-align: center; cursor: pointer; transition: transform .18s;
+  }
+  #panel.collapsed .chevron { transform: rotate(-90deg); }
+  #panel.collapsed #body { display: none; }
+  #panel.collapsed { padding-bottom: 12px; }
+  /* Once a route exists the collapsed header shows its shade figure. */
+  #summary { display: none; font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.4; }
+  #panel.collapsed #summary.has-route { display: block; }
+
   h1 { font-size: 16px; margin: 0 0 2px; }
   .sub { font-size: 12px; color: var(--muted); margin: 0 0 12px; line-height: 1.4; }
   label { font-size: 12px; font-weight: 600; display: block; margin: 10px 0 4px; }
@@ -38,15 +55,31 @@
   .bar { height:7px; border-radius:4px; background:#eee; margin-top:5px; overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--accent); }
   #status { font-size:12px; color: var(--muted); margin-top:10px; min-height: 16px; }
-  .legend { position:absolute; z-index:1000; bottom:14px; left:12px; background:#fff; padding:8px 10px; border-radius:8px; font-size:11px; box-shadow:0 3px 12px rgba(0,0,0,.15); line-height:1.7; }
-  .swatch { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:-1px; margin-right:5px; }
+
+  /* Phones: full width, anchored to the bottom so the controls sit under the thumb and the
+     collapsed panel is a slim bar rather than a sheet covering the map. */
+  @media (max-width: 640px) {
+    #panel {
+      top: auto; bottom: 8px; left: 8px; right: 8px; width: auto; max-width: none;
+      max-height: 70vh; border-radius: 14px;
+    }
+    .sub { display: none; }        /* the pitch is for desktop; on a phone it is just in the way */
+    .steps { display: none; }
+  }
 </style>
 </head>
 <body>
 <div id="map"></div>
 
 <div id="panel">
-  <h1>☀️ Shade Route <span style="font-weight:400;font-size:12px;color:var(--muted)">prototype</span></h1>
+  <div class="head" id="head">
+    <div style="flex:1">
+      <h1>☀️ por la sombra</h1>
+      <div id="summary"></div>
+    </div>
+    <button class="chevron" id="toggle" aria-label="Collapse panel" aria-expanded="true">▾</button>
+  </div>
+  <div id="body">
   <p class="sub">Finds the <b>shadiest walking route</b> between two points in Valencia — including <b>which side of the street</b> to walk on. Building heights come from the <b>Spanish Cadastre</b>, streets from OpenStreetMap, both baked into one precomputed file. Shadows and routing run <b>entirely in your browser</b>. No API keys, no server.</p>
 
   <label for="dt">Date & time</label>
@@ -71,13 +104,7 @@
 
   <div id="results"></div>
   <div id="status"></div>
-</div>
-
-<div class="legend">
-  <div><span class="swatch" style="background:#3b3b5c;opacity:.5"></span>Building shadow</div>
-  <div><span class="swatch" style="background:#2f8f4e"></span>Shadiest route (shaded part)</div>
-  <div><span class="swatch" style="background:#f4b400"></span>Sun-exposed segment</div>
-  <div><span class="swatch" style="background:#888"></span>Shortest route (comparison)</div>
+  </div><!-- /#body -->
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -706,6 +733,14 @@ async function findRoute() {
     document.getElementById("results").innerHTML =
       card("🌳 Shadiest", shady, true) + (same ? "" : card("Shortest", shortest, false));
 
+    // Carry the answer into the header, then get out of the way on a phone — you asked for a
+    // route because you want to look at the map, not at the form that produced it.
+    summaryEl.textContent =
+      `${Math.round(shady.shadePct*100)}% in shade · ${(shady.length/1000).toFixed(2)} km · ~${Math.round(shady.length/1.35/60)} min`;
+    summaryEl.classList.add("has-route");
+    if (isPhone()) setCollapsed(true);
+    layoutAttribution();   // the summary line makes the collapsed bar a line taller
+
     map.fitBounds(routeLayer.getBounds(), { padding: [40,40] });
     drawShadows(sun);
     const extra = Math.round(shady.length - shortest.length);
@@ -733,6 +768,37 @@ async function showShadowsOnly() {
   } catch (e) { setStatus("⚠️ " + e.message); }
   finally { setBusy(false); }
 }
+
+// ---------- Panel ----------
+const panel = document.getElementById("panel");
+const summaryEl = document.getElementById("summary");
+const toggleBtn = document.getElementById("toggle");
+const isPhone = () => window.matchMedia("(max-width: 640px)").matches;
+
+// On a phone the panel sits over the bottom-right attribution. Licence terms require that stay
+// visible, so lift it clear of the collapsed bar — measured, not guessed, since the bar grows a
+// line taller once it carries a route summary.
+function layoutAttribution() {
+  const el = document.querySelector(".leaflet-bottom.leaflet-right");
+  if (!el) return;
+  const collapsed = panel.classList.contains("collapsed");
+  el.style.bottom = (isPhone() && collapsed)
+    ? Math.round(panel.getBoundingClientRect().height) + 14 + "px"
+    : "";
+}
+
+function setCollapsed(on) {
+  panel.classList.toggle("collapsed", on);
+  toggleBtn.setAttribute("aria-expanded", String(!on));
+  toggleBtn.setAttribute("aria-label", on ? "Expand panel" : "Collapse panel");
+  layoutAttribution();
+}
+window.addEventListener("resize", layoutAttribution);
+// The whole header is the hit target — a 26 px chevron is a poor one on a phone.
+document.getElementById("head").onclick = () => setCollapsed(!panel.classList.contains("collapsed"));
+
+// Start collapsed on a phone: the map is the thing worth seeing first.
+if (isPhone()) setCollapsed(true);
 
 // ---------- UI plumbing ----------
 function setStatus(t) { document.getElementById("status").textContent = t; }
