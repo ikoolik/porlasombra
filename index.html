@@ -155,7 +155,7 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 // a gradient that does not exist. See _redraw for how both are solved at once.
 const ShadowCanvas = L.Layer.extend({
   gpu: false,
-  initialize(opts) { this._polys = []; this._opts = opts || {}; },
+  initialize(opts) { this._polys = []; this._opts = opts || {}; this._night = false; this._shown = false; },
 
   onAdd(map) {
     this._map = map;
@@ -174,8 +174,14 @@ const ShadowCanvas = L.Layer.extend({
     map.off("zoomanim", this._animateZoom, this);
   },
 
-  setPolys(polys) { this._polys = polys || []; this._redraw(); },
-  count() { return this._polys.length; },
+  setPolys(polys) { this._polys = polys || []; this._night = false; this._shown = true; this._redraw(); },
+  // Sun below the horizon: everywhere is shade, so fill rather than draw shapes.
+  setNight() { this._polys = []; this._night = true; this._shown = true; this._redraw(); },
+  // Whether the user has switched shadows on at all — distinct from how many are on screen, which
+  // is legitimately zero at night or in an empty view. Gating redraws on the count meant scrubbing
+  // into darkness latched the layer off and daylight never came back.
+  // (`_shown`, not `_on` — L.Evented already owns `_on` as its internal event binder.)
+  isOn() { return this._shown; },
 
   // Match Leaflet's own zoom animation so the shade does not detach mid-zoom.
   _animateZoom(e) {
@@ -203,6 +209,13 @@ const ShadowCanvas = L.Layer.extend({
     // canvas throws on drawImage, so wait for a real size — _reset will call us again.
     if (!size.x || !size.y) return;
     ctx.clearRect(0, 0, size.x, size.y);
+    if (this._night) {
+      ctx.globalAlpha = this._opts.alpha ?? 0.3;
+      ctx.fillStyle = this._opts.fill || "#3b3b5c";
+      ctx.fillRect(0, 0, size.x, size.y);
+      ctx.globalAlpha = 1;
+      return;
+    }
     if (!this._polys.length) return;
 
     // Project inline rather than via map.latLngToContainerPoint. There are ~200k vertices on
@@ -475,14 +488,24 @@ const ShadowGL = L.Layer.extend({
     if (!gl) return;
     const size = map.getSize();
     if (!size.x || !size.y) return;                 // no layout yet; _reset will call us again
+    const c = this._opts.rgb || [0.23, 0.23, 0.36], a = this._opts.alpha ?? 0.3;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this._canvas.width, this._canvas.height);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    // The sun position is read from `dt`, which does not exist yet on the very first draw — see
+    // the note on G's declaration. Everything below has to stay behind this guard.
     if (!G) return;                                 // artifact still loading — a cleared canvas is right
 
     const sun = SunCalc.getPosition(currentDate(), ...VALENCIA);
-    if (sun.altitude <= 0.03) return;               // below the horizon — handled as global night
+    // Below the horizon there is nothing to march: everywhere is shade, which is exactly what the
+    // router already reports (isShaded returns true), so the map has to say the same thing. One
+    // flat fill at the same tone a building's shadow gets — shade is binary, and night is shade.
+    if (sun.altitude <= 0.03) {
+      gl.clearColor(c[0] * a, c[1] * a, c[2] * a, a);   // premultiplied, to match the canvas
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return;
+    }
     if (!this._ensureRegion()) return;
 
     const zoom = map.getZoom();
@@ -559,9 +582,8 @@ const ShadowGL = L.Layer.extend({
     gl.uniform1f(this._march.u.uRise, stepM * Math.tan(sun.altitude));
     gl.uniform1f(this._march.u.uMaxH, this._maxH);
     gl.uniform1i(this._march.u.uSteps, Math.min(MAX_MARCH_STEPS, Math.ceil(padM / stepM) + 2));
-    const c = this._opts.rgb || [0.23, 0.23, 0.36];
     gl.uniform3f(this._march.u.uColor, c[0], c[1], c[2]);
-    gl.uniform1f(this._march.u.uAlpha, this._opts.alpha ?? 0.3);
+    gl.uniform1f(this._march.u.uAlpha, a);
     gl.bindBuffer(gl.ARRAY_BUFFER, this._quad);
     const aXY = gl.getAttribLocation(this._march.p, "aXY");
     gl.enableVertexAttribArray(aXY);
@@ -632,7 +654,7 @@ let redrawTimer = null;
 function redrawShadows() {
   if (!G) return;
   if (shadowLayer.gpu) { shadowLayer.redraw(); return; }
-  if (!shadowLayer.count()) return;
+  if (!shadowLayer.isOn()) return;
   clearTimeout(redrawTimer);
   redrawTimer = setTimeout(() => {
     const b = map.getBounds();
@@ -1085,7 +1107,8 @@ function drawShadows(sun) {
   // The 2D fallback draws only what is on screen, and only when zoomed in far enough for a shadow
   // to be worth a pixel — below that it is sub-pixel smudge that still costs a full path fill.
   const DRAW_MIN_ZOOM = 13;
-  if (sun.altitude <= 0.03 || !lastShadows || map.getZoom() < DRAW_MIN_ZOOM) {
+  if (sun.altitude <= 0.03) { shadowLayer.setNight(); return; }   // everywhere is shade
+  if (!lastShadows || map.getZoom() < DRAW_MIN_ZOOM) {
     shadowLayer.setPolys([]);
     return;
   }
@@ -1239,7 +1262,7 @@ document.getElementById("shadeBtn").onclick = showShadowsOnly;
 if (!shadowLayer.gpu) {
   let moveTimer = null;
   map.on("moveend zoomend", () => {
-    if (!G || !shadowLayer.count()) return;
+    if (!G || !shadowLayer.isOn()) return;
     clearTimeout(moveTimer);
     moveTimer = setTimeout(() => {
       const b = map.getBounds();

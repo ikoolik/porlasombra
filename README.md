@@ -62,6 +62,8 @@ Shade is a property of a *place*, not of a building, so it is computed per pixel
 
 Nothing is precomputed or shipped — the height field is rasterised on demand from the rings already in the artifact, at display resolution, so the shade is exactly as sharp as the screen at any zoom.
 
+Below the horizon there is nothing to march: the whole view fills at the same tone a building's shadow gets, because everywhere is shade and that is what the router already reports. Shade is binary, and night is shade.
+
 The point is the cost model. The old renderer built a convex hull per building and filled a path per shadow, which cost tens of milliseconds for a dense viewport and forced a 120 ms debounce on the time slider and 200 ms on pan. Marching pixels costs the same whether the view holds 200 buildings or 20,000, so the debounces are gone: the shade tracks the map and the time slider at 60 fps.
 
 WebGL is not a hard requirement — without it the app falls back to the old 2D renderer, which costs nothing to keep because the router builds those hulls for its own use anyway.
