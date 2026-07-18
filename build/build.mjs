@@ -14,6 +14,7 @@ import { buildGraph, components, stitch, CROSS_PENALTY_M } from "./build-graph.m
 import { buildCanopy } from "./parse-trees.mjs";
 import { parseAddresses } from "./parse-addresses.mjs";
 import { joinStreetNames } from "./join-streets.mjs";
+import { parsePois } from "./parse-pois.mjs";
 
 const DATA = path.resolve(import.meta.dirname, "../data");
 const BBOX = [39.42, -0.42, 39.51, -0.32]; // s,w,n,e — Valencia city
@@ -191,6 +192,38 @@ for (const [si, list] of [...byStreet.entries()].sort((a, b) => a[0] - b[0])) {
 console.log(`  ${sName.length} streets, ${aNum.length} numbered entrances ` +
             `(${dropped} duplicate numbers merged)`);
 
+console.log("→ landmarks");
+const { pois, stats: poiStats } = parsePois(
+  fs.readFileSync(path.join(DATA, "pois.geojsonseq"), "utf8"), BBOX);
+console.log(`  ${poiStats.named} named of ${poiStats.seen} features, ` +
+            `${poiStats.categorised} in a landmark category`);
+console.log(`  ${poiStats.merged} same-name duplicates merged, ${poiStats.outside} outside bbox ` +
+            `-> ${poiStats.kept} kept`);
+
+// Landmarks ship as their own columns rather than as streets without numbers: they carry a
+// category label and a rank, and the search ranks them against streets using both.
+const pName = [], pAlias = [], pCat = [], pRank = [], pLon = [], pLat = [];
+const catLabels = [];
+const catIndex = new Map();
+// Strongest landmarks first, so ties in the browser's text score fall out in a sensible order
+// without it having to sort by rank separately.
+pois.sort((a, b) => b.rank - a.rank || a.name.localeCompare(b.name));
+{
+  let qx = 0, qy = 0;
+  for (const p of pois) {
+    let ci = catIndex.get(p.label);
+    if (ci === undefined) { ci = catLabels.length; catIndex.set(p.label, ci); catLabels.push(p.label); }
+    pName.push(p.name);
+    pAlias.push(p.alias || "");
+    pCat.push(ci);
+    pRank.push(p.rank);
+    const x = Math.round(p.lon * Q), y = Math.round(p.lat * Q);
+    pLon.push(x - qx); pLat.push(y - qy);
+    qx = x; qy = y;
+  }
+}
+console.log(`  ${pName.length} landmarks across ${catLabels.length} categories`);
+
 const artifact = {
   meta: {
     city: "Valencia", bbox: BBOX, quant: Q,
@@ -200,11 +233,12 @@ const artifact = {
       streets: "OpenStreetMap via Geofabrik",
       trees: "Ajuntament de València, Servicio de Parques y Jardines (CC BY 4.0)",
       addresses: "Catastro INSPIRE AD 46900, street names from OpenStreetMap",
+      landmarks: "OpenStreetMap named places via Geofabrik",
     },
     counts: {
       nodes: keptNodes.length, edges: eLen.length,
       buildings: bRings.length, trees: canopy.tSp.length,
-      streets: sName.length, addresses: aNum.length,
+      streets: sName.length, addresses: aNum.length, landmarks: pName.length,
     },
     crossPenaltyM: CROSS_PENALTY_M,
     // Crown dimension table, indexed by tSp: [height, crownDiameter, crownBase] in decimetres,
@@ -212,6 +246,8 @@ const artifact = {
     // falls back to once the leaves are off.
     species: canopy.species,
     tauBare: canopy.tauBare,
+    // Landmark category labels, indexed by pCat.
+    catLabels,
   },
   // Flat, quantised, delta-encoded arrays: JSON that gzips like a binary format.
   nodes: (() => {
@@ -238,6 +274,7 @@ const artifact = {
   // house numbers hang off them by count rather than by a repeated street id, so `sCount` is the
   // only join needed. Positions are entrance points, delta-encoded like everything else.
   sName, sAlias, sCount, aNum, aLon, aLat,
+  pName, pAlias, pCat, pRank, pLon, pLat,
 };
 
 const out = path.join(DATA, "valencia.json");

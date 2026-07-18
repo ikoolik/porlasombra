@@ -8,6 +8,13 @@ proj4.defs("EPSG:25830", "+proj=utm +zone=30 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0
 const utm30nToWgs84 = proj4("EPSG:25830", "EPSG:4326");
 export const toWgs84 = (x, y) => utm30nToWgs84.forward([x, y]);
 
+// Fold accents, case and punctuation away, so "Xàtiva" and "xativa" are the same string. Mirrored
+// by normalizeQ() in index.html: the build dedupes names with it and the browser searches with it,
+// and the two disagreeing would mean a name that exists but cannot be found.
+export const normalizeName = (s) =>
+  s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+   .replace(/[^a-z0-9]+/g, " ").trim();
+
 const R = 6371000, toRad = Math.PI / 180;
 
 export function metres(a, b) {

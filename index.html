@@ -113,7 +113,7 @@
   <label for="fromQ"><span class="badge a sm">A</span>From</label>
   <div class="geo" id="fromG">
     <input id="fromQ" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
-           placeholder="Street and number, or click the map" />
+           placeholder="Address or landmark, or click the map" />
     <button class="clear" id="fromC" tabindex="-1" aria-label="Clear start">×</button>
     <ul class="sugg" id="fromS" role="listbox"></ul>
   </div>
@@ -121,7 +121,7 @@
   <label for="toQ"><span class="badge b sm">B</span>To</label>
   <div class="geo" id="toG">
     <input id="toQ" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
-           placeholder="Street and number, or click the map" />
+           placeholder="Address or landmark, or click the map" />
     <button class="clear" id="toC" tabindex="-1" aria-label="Clear destination">×</button>
     <ul class="sugg" id="toS" role="listbox"></ul>
   </div>
@@ -139,7 +139,7 @@
   <input type="range" id="alpha" min="0" max="4" step="0.1" value="1.2" />
 
   <ol class="steps">
-    <li>Search a street and number above, or click the map to drop <span class="badge a">A</span> (start) then <span class="badge b">B</span> (end). Markers are draggable.</li>
+    <li>Search an address or landmark above, or click the map to drop <span class="badge a">A</span> (start) then <span class="badge b">B</span> (end). Markers are draggable.</li>
     <li>Press <b>Find shady route</b>.</li>
   </ol>
 
@@ -1221,7 +1221,27 @@ function buildGeo(a) {
   // One haystack per street: the display name plus the Catastro spelling where it differs, so
   // "Eivissa" and "Ibiza" both land on the same street.
   const norm = names.map((n, i) => normalizeQ(alias[i] ? n + " " + alias[i] : n).split(" "));
-  return { names, counts, start, num, lon, lat, norm };
+  // Length is measured on the *displayed* name, never the haystack: an alias is extra ways to
+  // find a place, and must not cost it rank for having them.
+  const normLen = names.map((n) => normalizeQ(n).length);
+
+  // Landmarks: the same idea, one flat list. Their aliases carry every other spelling OSM knows —
+  // Spanish, Valencian, English and the acronym — which is how "IVAM" finds a museum displayed
+  // under its full name.
+  const pn = a.pName || [], pa = a.pAlias || [], labels = a.meta.catLabels || [];
+  const pCount = pn.length;
+  const pLon = new Float64Array(pCount), pLat = new Float64Array(pCount);
+  let px = 0, py = 0;
+  for (let i = 0; i < pCount; i++) { px += a.pLon[i]; py += a.pLat[i]; pLon[i] = px / q; pLat[i] = py / q; }
+  const pNorm = pn.map((n, i) => normalizeQ(pa[i] ? n + " " + pa[i] : n).split(" "));
+  const pNormLen = pn.map((n) => normalizeQ(n).length);
+
+  return {
+    names, counts, start, num, lon, lat, norm, normLen,
+    pName: pn, pNorm, pNormLen, pLon, pLat,
+    pLabel: (a.pCat || []).map((c) => labels[c] || ""),
+    pRank: a.pRank || [],
+  };
 }
 
 // Fold accents and punctuation away: people type "xativa" for "Xàtiva" and "d Eivissa" for
@@ -1233,22 +1253,24 @@ function normalizeQ(s) {
 
 const HOUSE_RE = /[\s,]+(\d+[a-zA-Z]?)\s*$/;
 
-// Returns up to `limit` places for a query like "xativa 12", "carrer de la pau" or "pau 3".
+// Returns up to `limit` places for a query like "xativa 12", "mercat central" or "ivam".
 function geoSearch(q, limit = 8) {
   const geo = G && G.geo;
   if (!geo || !geo.names.length) return [];
   const raw = q.trim();
   if (raw.length < 2) return [];
 
-  // A trailing number is a house number, not part of the street name — except where the street
-  // *is* a number, which is why the street match is retried on the whole string if this fails.
+  // A trailing number is a house number, not part of the name — except where the name itself
+  // ends in one, which is why the match is retried on the whole string if this fails.
   const h = HOUSE_RE.exec(raw);
   const wanted = h ? h[1].toLowerCase() : null;
-  let hits = matchStreets(geo, h ? raw.slice(0, h.index) : raw);
-  if (!hits.length && wanted) hits = matchStreets(geo, raw);
+  const text = h ? raw.slice(0, h.index).trim() : raw;
 
   const out = [];
   if (wanted) {
+    // A number means an address, and only streets have those — no landmark is "Bioparc 12".
+    let hits = matchList(geo.norm, geo.normLen, text);
+    if (!hits.length) hits = matchList(geo.norm, geo.normLen, raw);
     // Exact number first, then the ones being typed towards, so "1" still offers 1 before 10.
     for (const pass of [0, 1]) {
       for (const { i } of hits) {
@@ -1285,29 +1307,46 @@ function geoSearch(q, limit = 8) {
       }
       if (out.length) return out;
     }
-    // Nothing numbered at all — fall through to the streets themselves rather than an empty list.
+    // Nothing numbered matched at all — fall through and treat it as a plain name search.
   }
-  for (const { i } of hits) {
-    const s = geo.start[i], c = geo.counts[i];
-    out.push({
-      label: geo.names[i],
-      hint: c ? (c > 1 ? `nos. ${geo.num[s]}–${geo.num[s + c - 1]}` : `no. ${geo.num[s]}`) : "",
-      // The middle entrance stands for the street: on a long one, its ends are a poor guess.
-      lat: geo.lat[s + (c >> 1)], lon: geo.lon[s + (c >> 1)],
-    });
+
+  // Streets and landmarks compete in one ranking. Text score dominates; the small constants only
+  // break ties, so a street beats an equally-matching school but loses to an exact-name museum.
+  const general = wanted ? (text || raw) : raw;
+  const cands = [];
+  for (const c of matchList(geo.norm, geo.normLen, general)) cands.push({ street: true, i: c.i, score: c.score + 0.3 });
+  for (const c of matchList(geo.pNorm, geo.pNormLen, general)) cands.push({ street: false, i: c.i, score: c.score + geo.pRank[c.i] * 0.05 });
+  cands.sort((a, b) => b.score - a.score);
+
+  for (const c of cands) {
     if (out.length >= limit) break;
+    if (c.street) {
+      const s = geo.start[c.i], n = geo.counts[c.i];
+      // Catastro's "S/N" (sin número) sorts after the digits, so walk back to the last real
+      // number for the range — "nos. 2–S-N" reads like a typo.
+      let last = n - 1;
+      while (last > 0 && !/^\d/.test(geo.num[s + last])) last--;
+      out.push({
+        label: geo.names[c.i],
+        hint: last > 0 ? `nos. ${geo.num[s]}–${geo.num[s + last]}` : `no. ${geo.num[s]}`,
+        // The middle entrance stands for the street: on a long one, its ends are a poor guess.
+        lat: geo.lat[s + (n >> 1)], lon: geo.lon[s + (n >> 1)],
+      });
+    } else {
+      out.push({ label: geo.pName[c.i], hint: geo.pLabel[c.i], lat: geo.pLat[c.i], lon: geo.pLon[c.i] });
+    }
   }
   return out;
 }
 
 // Every typed word must begin some word of the name, so "pau" finds "Carrer de la Pau" and
 // "carrer pau" narrows it, while word order is not something the user has to guess.
-function matchStreets(geo, text, limit = 40) {
+function matchList(norm, lens, text, limit = 40) {
   const toks = normalizeQ(text).split(" ").filter(Boolean);
   if (!toks.length) return [];
   const hits = [];
-  for (let i = 0; i < geo.norm.length; i++) {
-    const words = geo.norm[i];
+  for (let i = 0; i < norm.length; i++) {
+    const words = norm[i];
     let score = 0, ok = true;
     for (const t of toks) {
       let w = -1;
@@ -1317,7 +1356,7 @@ function matchStreets(geo, text, limit = 40) {
     }
     if (!ok) continue;
     // Prefer the tighter name: "Carrer de la Pau" over "Carrer de la Pau i la Concòrdia".
-    score -= words.join(" ").length / 200;
+    score -= lens[i] / 200;
     hits.push({ i, score });
   }
   hits.sort((a, b) => b.score - a.score);
@@ -1856,7 +1895,9 @@ loadArtifact().then(() => {
     document.getElementById("shadeBtn").style.display = "none";
     shadowLayer.redraw();
   }
-  setStatus(`Search an address or click the map. ${G.geo.names.length.toLocaleString()} streets loaded.`);
+  setStatus(`Search an address or landmark, or click the map. ` +
+            `${G.geo.names.length.toLocaleString()} streets and ` +
+            `${G.geo.pName.length.toLocaleString()} landmarks loaded.`);
   setBusy(false);
 }).catch((e) => {
   setStatus("⚠️ Could not load map data: " + e.message);

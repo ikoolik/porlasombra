@@ -24,15 +24,21 @@ where **α** is the shade-preference slider. At α = 0 you get the plain shortes
 
 Because every edge costs at least its own length, straight-line distance to the target never overestimates the remaining cost, so A\* returns the exact optimum, not an approximation.
 
-### Searching for an address
+### Searching for a place
 
-You can type where you're going — **2,742 streets and 42,241 numbered entrances**, searched in the browser like everything else. No geocoding API, no request per keystroke.
+You can type where you're going — **2,742 streets, 42,241 numbered entrances and 1,422 landmarks**, searched in the browser like everything else. No geocoding API, no request per keystroke.
 
 Positions come from the Cadastre's address dataset, which places the **door** rather than the building centroid — the right point for a walking route. Street *names* come from OpenStreetMap, matched to each Cadastre street spatially, because the Cadastre writes them uppercased, unaccented and article-last (`CL ARGENTERS DELS`) while OSM carries the current official spelling (`Carrer dels Argenters`). Both spellings stay searchable, which means the search works across languages for free: **`ibiza` finds `Carrer d'Eivissa`**, and `harina` finds `Carrer de la Farina`.
 
 That spatial match needs a guard, since a street missing from OSM would otherwise quietly adopt the name of the cross street its addresses sit nearest. Two rules contain it — a majority of a street's addresses must agree on the name, and one OSM name is claimed by at most one Cadastre street. 80% of streets are named this way; the rest keep their own name, expanded and title-cased. A doubtful join is always the worse trade: the fallback is less idiomatic, never wrong.
 
 House numbers have real gaps (Avinguda del Port runs 99, 101), so a number that doesn't exist offers the nearest door that does rather than silently landing you mid-street.
+
+Landmarks come from OpenStreetMap, and the work there is deciding what *is* one. 8,076 named features survive the tag filter and most would make the search worse — 1,196 restaurants, a bus stop tagged `Bioparc`, and seven things called "Estadi Ciutat de València" of which one is the stadium. What ships is a curated set of categories people walk *to* (markets, stations, parks, museums, squares, beaches, hospitals, schools), deduplicated by name and proximity so each place appears once, with transport ranked below the venues it is named after. That leaves **1,422**.
+
+Every spelling OSM knows is kept searchable, so `ivam` finds the museum displayed as *Institut Valencià d'Art Modern*, and `playa malvarrosa` finds *Platja de la Malva-rosa*.
+
+Landmarks and streets compete in one ranking. The text score dominates and category rank only breaks ties, so an exact-name museum beats a street that merely contains the word, and a school named after a beach loses to the beach.
 
 ## Architecture
 
@@ -44,15 +50,15 @@ Build (occasional)                          Browser (every query)
 Catastro buildingpart.gml ─┐
 OSM extract ─ osmium ──────┤
 Municipal tree inventory ──┼─→ 6.2 MB  ──→  load once, decode
-Catastro addresses ────────┘   artifact      ↓
-                                            shadows for the corridor
+Catastro addresses ────────┤   artifact      ↓
+OSM named landmarks ───────┘                shadows for the corridor
                                              ↓
                                             A* ×2, lazy sun sampling
                                              ↓
                                             draw (WebGL, per pixel)
 ```
 
-The whole city — 277,651 sidewalk nodes, 436,804 edges, 196,676 building parts, 144,592 street trees and 42,241 addresses — is baked offline into one 6.2 MB gzipped file. The browser fetches it once and does everything else locally: no API keys, no routing service, no per-request cost. Hosting is a static file on a CDN.
+The whole city — 277,651 sidewalk nodes, 436,804 edges, 196,676 building parts, 144,592 street trees, 42,241 addresses and 1,422 landmarks — is baked offline into one 6.2 MB gzipped file. The browser fetches it once and does everything else locally: no API keys, no routing service, no per-request cost. Hosting is a static file on a CDN.
 
 ### Why the build step exists
 
@@ -121,6 +127,7 @@ Then open `http://localhost:8000` — the app expects `data/valencia.json.gz` to
 | Walkable street network | OpenStreetMap via [Geofabrik](https://download.geofabrik.de/) | ODbL |
 | Street tree inventory | [Ajuntament de València](https://geoportal.valencia.es/) — Servicio de Parques y Jardines | CC BY 4.0 |
 | Address points for search | [Spanish Cadastre](https://www.catastro.hacienda.gob.es/webinspire/index_eng.html) (INSPIRE `addresses`) | Free reuse, attribution to Dirección General del Catastro |
+| Landmarks for search | OpenStreetMap via [Geofabrik](https://download.geofabrik.de/) | ODbL |
 | Sun position | [SunCalc](https://github.com/mourner/suncalc) 1.9.0 | BSD-2-Clause |
 | Map tiles | OpenStreetMap | [Tile usage policy](https://operations.osmfoundation.org/policies/tiles/) |
 
@@ -141,7 +148,7 @@ The tree inventory is the same problem one step worse: it carries no height or c
 - The 2D fallback cannot express partial shade at all, so it draws only crowns that are nearly opaque anyway and ignores sheer ones. The GPU path, which is what nearly everyone gets, shades them properly.
 - One sun position for the whole view (fine at city scale).
 - Pavement offsets are synthesised from road width, not surveyed sidewalk geometry.
-- Search covers streets and house numbers, not landmarks or businesses — "Mercat Central" finds the *square* named after it, not the market itself.
+- Landmark search is a curated category list, not a business directory: shops, restaurants and bars are deliberately excluded, so a named café is not findable.
 - 20% of streets show the Cadastre's own name rather than the local one, because the spatial join to OpenStreetMap was not confident enough to borrow it.
 - **Valencia only.** Anywhere outside the precomputed bounding box has no data.
 
