@@ -27,7 +27,7 @@
 
   /* Overlay stacks. The design is drawn at 390 px; on a wide screen the bars would stretch to
      something unusable, so they cap out and hug the left — the rail the handoff calls for. */
-  #top, #bottom { position:absolute; z-index:30; display:flex; flex-direction:column; width:100%; max-width:412px; }
+  #top, #bottom { position:absolute; z-index:30; display:flex; flex-direction:column; width:100%; max-width:412px; touch-action:manipulation; }
   #top { top:14px; left:14px; padding-right:28px; gap:9px; }
   #bottom { left:0; bottom:0; padding:0 12px 12px; gap:10px; max-width:436px; }
   @media (min-width: 760px) { #top { top:18px; } }
@@ -37,7 +37,10 @@
   /* Search bar */
   #searchBar { display:flex; align-items:center; gap:11px; padding:14px 16px; }
   #searchBar .glyph { font:600 17px "DM Sans"; color:var(--green); }
-  #q { flex:1; min-width:0; border:none; outline:none; background:transparent; font:600 15px "DM Sans"; color:var(--ink); }
+  /* 16px, not the handoff's 15: iOS Safari auto-zooms the page on focusing any input smaller
+     than that, and the zoom does not undo itself — the whole UI stays offset afterwards. One
+     pixel is invisible; the zoom is not. */
+  #q { flex:1; min-width:0; border:none; outline:none; background:transparent; font:600 16px "DM Sans"; color:var(--ink); }
   #q::placeholder { color:var(--muted-2); font-weight:600; }
   #qClear { border:none; background:none; padding:0 2px; font:600 16px "DM Sans"; color:var(--muted-2); cursor:pointer; }
 
