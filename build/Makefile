@@ -21,11 +21,13 @@ BLD     := $(DATA)/buildings.json
 TREES   := $(DATA)/trees.json
 OUT     := $(DATA)/valencia.json.gz
 
-WALKABLE := footway,path,steps,pedestrian,cycleway,track,living_street,corridor,\
-residential,unclassified,tertiary,tertiary_link,secondary,secondary_link,\
-primary,primary_link,service,road
+# One line, no line continuations: a `\`-wrapped list expands with embedded spaces, and since this
+# is used unquoted as `w/highway=$(WALKABLE)`, the shell then splits it into several arguments —
+# which silently dropped every road carriageway class (residential/tertiary/secondary/primary/…),
+# leaving an all-footway graph that fell apart wherever OSM maps only the carriageway.
+WALKABLE := footway,path,steps,pedestrian,cycleway,track,living_street,corridor,residential,unclassified,tertiary,tertiary_link,secondary,secondary_link,primary,primary_link,service,road
 
-all: $(OUT)
+all: verify
 
 $(DATA):
 	mkdir -p $(DATA)
@@ -105,7 +107,16 @@ dist: $(OUT)
 	  echo "artifact version: $$v"
 	@echo "dist ready: $$(du -sh $(DIST) | cut -f1)"
 
-deploy: dist
+# Health gate: refuse to package or ship a graph that routes badly (see verify-artifact.mjs). Runs
+# on every `make`, and again before `deploy`, so a regressed artifact never reaches Cloudflare.
+verify: $(OUT)
+	node verify-artifact.mjs
+
+# Fast static + unit tests (Makefile filter, weldLocal, gate logic). No artifact required.
+test:
+	node --test
+
+deploy: dist verify
 	npx wrangler pages deploy $(DIST) --project-name=$(PROJECT) --commit-dirty=true
 
 # --- scheduled refresh: re-pull every source, rebuild, deploy only if the city changed ---
@@ -124,4 +135,4 @@ clean:
 distclean: clean
 	rm -rf $(DATA)
 
-.PHONY: all dist deploy clean distclean
+.PHONY: all dist deploy verify test clean distclean

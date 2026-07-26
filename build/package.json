@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "description": "Offline precompute: Catastro buildings + OSM streets -> static routing artifact",
-  "scripts": { "build": "node build.mjs" },
+  "scripts": { "build": "node build.mjs", "test": "node --test", "verify": "node verify-artifact.mjs" },
   "dependencies": { "proj4": "^2.12.1" }
 }
