@@ -35,6 +35,17 @@
 
   .bar { background:#fff; border-radius:16px; box-shadow:var(--card); }
 
+  /* Basemap picker — a floating dropdown, top-right (the left rail holds search + trip). */
+  .basemap-control { margin:14px 14px 0 0; }
+  .basemap-control select {
+    -webkit-appearance:none; appearance:none; cursor:pointer;
+    background:#fff; border:none; border-radius:12px; box-shadow:var(--card);
+    color:var(--ink); font:600 13px "DM Sans"; padding:9px 32px 9px 13px;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2 4.5l4 4 4-4' fill='none' stroke='%239aa0a8' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat:no-repeat; background-position:right 12px center;
+  }
+  .basemap-control select:focus-visible { outline:2px solid var(--green); outline-offset:1px; }
+
   /* Search bar */
   #searchBar { display:flex; align-items:center; gap:11px; padding:14px 16px; }
   #searchBar .glyph { font:600 17px "DM Sans"; color:var(--green); }
@@ -237,29 +248,89 @@ const map = L.map("map", { zoomControl: false }).setView(VALENCIA, 16);
 // derived from it are OSM (ODbL requires crediting a derived database), every building footprint
 // and height comes from the Spanish Cadastre, and the canopy is the Ajuntament's tree inventory,
 // whose CC BY 4.0 makes this line an obligation rather than a courtesy.
-// Basemap: self-hosted Protomaps vector tiles, rendered in the browser by protomaps-leaflet.
-// This removes the app's one runtime dependency on someone else's infrastructure — OSMF's
-// donation-funded tile servers — and the desaturated "light" flavor (Positron-like) keeps the
-// green/orange route legible instead of fighting osm-carto's terrain tints and POI icons.
-// The custom WebGL shade overlay below is a separate GridLayer with its own Web Mercator maths;
-// this swap does not touch it.
+// Basemap: three layers, switchable from the dropdown (top-right). The default is Protomaps —
+// self-hosted vector tiles rendered in-browser by protomaps-leaflet from a .pmtiles file, so the
+// app keeps no runtime dependency on anyone's donated tile servers, and its desaturated "light"
+// flavor keeps the green/orange route legible instead of fighting osm-carto's tints and POI icons.
+// OpenStreetMap raster is kept for comparison; Esri World Imagery (keyless) shows real canopy and
+// rooftops behind the shade model. All three live in Leaflet's tilePane — below the shade overlay,
+// route and markers — so the custom WebGL shade layer is untouched by a basemap switch.
 //
-// BASEMAP_PMTILES is the single swap point between environments. PMTiles needs HTTP Range
-// requests: locally, any range-capable static server over data/valencia.pmtiles works; in
-// production Cloudflare Pages does NOT serve ranges, so this must point at an R2-backed URL
-// (e.g. https://tiles.porlasombra.com/valencia.pmtiles) — see README "Basemap".
+// Attribution is layered: the street graph is OSM (ODbL) under every basemap, and the footprints
+// (Catastro) and canopy (Ajuntament, CC BY 4.0) are always on screen — so each layer carries that
+// shared credit plus its own basemap source, and Leaflet shows whichever layer is active.
+//
+// BASEMAP_PMTILES is the single swap point between environments. PMTiles needs HTTP Range requests:
+// locally a range-capable static server over data/valencia.pmtiles works (python's http.server does
+// NOT — see README); in production Cloudflare Pages does not serve ranges, so this must point at an
+// R2-backed URL (e.g. https://tiles.porlasombra.com/valencia.pmtiles).
 const BASEMAP_PMTILES = "data/valencia.pmtiles";
-protomapsL.leafletLayer({
-  url: BASEMAP_PMTILES,
-  flavor: "light",
-  lang: "es",
-  maxZoom: 19,   // overzoom past the archive's z15 max, matching the old raster behaviour
-  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · ' +
-               '<a href="https://protomaps.com">Protomaps</a> · ' +
-               '<a href="https://www.catastro.hacienda.gob.es/">Catastro</a> · ' +
-               '<a href="https://geoportal.valencia.es/">Ajuntament de València</a> · ' +
-               '<a href="https://github.com/ikoolik/porlasombra">código</a>',
-}).addTo(map);
+
+const OSM_CREDIT  = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
+const DATA_CREDIT =
+  ' · <a href="https://www.catastro.hacienda.gob.es/">Catastro</a>' +
+  ' · <a href="https://geoportal.valencia.es/">Ajuntament de València</a>' +
+  ' · <a href="https://github.com/ikoolik/porlasombra">código</a>';
+
+// Insertion order = dropdown order; keys are the labels shown in the <select>.
+const basemaps = {
+  "Mapa": protomapsL.leafletLayer({
+    url: BASEMAP_PMTILES,
+    flavor: "light",
+    lang: "es",
+    maxZoom: 19,   // overzoom past the archive's z15 max, matching the old raster behaviour
+    attribution: OSM_CREDIT + ' · <a href="https://protomaps.com">Protomaps</a>' + DATA_CREDIT,
+  }),
+  "OpenStreetMap": L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: OSM_CREDIT + DATA_CREDIT,
+  }),
+  "Satélite": L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {
+      maxZoom: 19,
+      attribution: 'Imágenes © <a href="https://www.esri.com/">Esri</a>, Maxar, Earthstar Geographics' +
+                   ' · ' + OSM_CREDIT + DATA_CREDIT,
+    }),
+};
+const DEFAULT_BASEMAP = "Mapa";
+
+// Exactly one basemap on the map at a time; a swap removes the old before adding the new. Basemaps
+// live in the tilePane, so they always render beneath the shade overlay/route/markers regardless
+// of add order — no bringToBack needed.
+let activeBasemap = null;
+function setBasemap(name) {
+  const next = basemaps[name];
+  if (!next || next === activeBasemap) return;
+  if (activeBasemap) map.removeLayer(activeBasemap);
+  next.addTo(map);
+  activeBasemap = next;
+}
+
+// A plain <select> inside a Leaflet control — native, one tap on mobile, and it is the "dropdown"
+// the UI asks for. disableClickPropagation keeps taps/scroll on it from panning or zooming the map.
+const BasemapControl = L.Control.extend({
+  options: { position: "topright" },
+  onAdd() {
+    const wrap = L.DomUtil.create("div", "basemap-control");
+    const sel = L.DomUtil.create("select", "", wrap);
+    for (const name of Object.keys(basemaps)) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    sel.value = DEFAULT_BASEMAP;
+    sel.setAttribute("aria-label", "Capa del mapa");
+    L.DomEvent.disableClickPropagation(wrap);
+    L.DomEvent.disableScrollPropagation(wrap);
+    L.DomEvent.on(sel, "change", () => setBasemap(sel.value));
+    return wrap;
+  },
+});
+
+setBasemap(DEFAULT_BASEMAP);
+new BasemapControl().addTo(map);
 
 // ---------- Shadow rendering ----------
 // Shade is a per-pixel property, so the GPU path (ShadowGL, below) computes it per pixel. The 2D
