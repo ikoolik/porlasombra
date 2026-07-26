@@ -119,11 +119,50 @@ Downloads ~240 MB of source data and produces `data/valencia.json.gz`. A couple 
 
 ## Running it
 
+The app needs `data/valencia.json.gz` (the city artifact) and `data/valencia.pmtiles` (the
+basemap — see [Basemap](#basemap)) to exist. Because the basemap is served over **HTTP Range
+requests**, the static server has to honour them — `python3 -m http.server` does **not** (it
+answers `200` with the whole file), so the tiles stay blank under it. Use any range-capable
+server, e.g.:
+
 ```bash
-python3 -m http.server 8000
+npx http-server -p 8000 -c-1 .
 ```
 
-Then open `http://localhost:8000` — the app expects `data/valencia.json.gz` to exist.
+Then open `http://localhost:8000`.
+
+## Basemap
+
+The basemap is **self-hosted Protomaps vector tiles**, rendered in the browser by
+[`protomaps-leaflet`](https://github.com/protomaps/protomaps-leaflet) — a drop-in `L.GridLayer`
+swap for the old OSM raster `L.tileLayer`. This removes the app's one runtime dependency on
+someone else's infrastructure (OSMF's donation-funded tile servers), and the desaturated
+`light` flavor keeps the green/orange route legible instead of fighting osm-carto's tints. The
+WebGL shade overlay is a separate layer with its own Web Mercator maths and is untouched by the
+swap.
+
+**Cutting the extract.** A single `.pmtiles` file, cut from the Protomaps daily planet build:
+
+```bash
+go install github.com/protomaps/go-pmtiles@latest
+make -C build basemap          # → data/valencia.pmtiles (~13 MB, Valencia metro, z15)
+```
+
+Planet builds are retained ~7 days, so **pin the copy** — don't hotlink. Re-cut on the same
+cadence as the data rebuild.
+
+**Hosting.** PMTiles needs HTTP Range. Cloudflare **Pages does not serve ranges** (returns
+`200` + the whole file), so the `.pmtiles` is **not** shipped in `dist/`; it must live on **R2**.
+The `BASEMAP_PMTILES` constant in `index.html` is the single swap point — a local path in dev,
+an R2-backed URL in production. Remaining production setup (not automated here — needs the
+Cloudflare account):
+
+- Create an R2 bucket, upload the pinned `valencia.pmtiles`, bind it to a subdomain (e.g.
+  `tiles.porlasombra.com`) for same-origin.
+- Set CORS on the bucket: `GET`+`HEAD`, allow `range`/`if-match`, expose `etag`.
+- Point `BASEMAP_PMTILES` at that URL and update attribution if the flavor changes.
+
+R2's free tier (10 GB storage, egress free) covers this at **$0/month**.
 
 ## Data sources
 
@@ -135,7 +174,7 @@ Then open `http://localhost:8000` — the app expects `data/valencia.json.gz` to
 | Address points for search | [Spanish Cadastre](https://www.catastro.hacienda.gob.es/webinspire/index_eng.html) (INSPIRE `addresses`) | Free reuse, attribution to Dirección General del Catastro |
 | Landmarks for search | OpenStreetMap via [Geofabrik](https://download.geofabrik.de/) | ODbL |
 | Sun position | [SunCalc](https://github.com/mourner/suncalc) 1.9.0 | BSD-2-Clause |
-| Map tiles | OpenStreetMap | [Tile usage policy](https://operations.osmfoundation.org/policies/tiles/) |
+| Basemap tiles | [Protomaps](https://protomaps.com/) daily planet build (OpenStreetMap data), self-hosted as PMTiles | ODbL (data) · Protomaps basemap style |
 
 **Use `buildingpart`, not `building`** — in the `building` layer `numberOfFloorsAboveGround` is nil, and the spec is explicit that the figure only exists on `BuildingPart`. Parts are what you want anyway: a tower on a retail podium is two prisms with different heights, which a single footprint cannot express.
 

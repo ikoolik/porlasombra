@@ -196,6 +196,10 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
+<!-- Self-contained UMD bundle (exposes `protomapsL`, bundles its own pmtiles reader), so the
+     dep-skew the issue flagged — protomaps-leaflet 5.1.0 declaring pmtiles@^3 — never surfaces:
+     we load this one file, not pmtiles separately. -->
+<script src="https://unpkg.com/protomaps-leaflet@5.1.0/dist/protomaps-leaflet.js"></script>
 <script>
 // ---------- Config ----------
 // The sidewalk graph, the walkability rules and the crossing penalties all live in the build
@@ -232,9 +236,25 @@ const map = L.map("map", { zoomControl: false }).setView(VALENCIA, 16);
 // derived from it are OSM (ODbL requires crediting a derived database), every building footprint
 // and height comes from the Spanish Cadastre, and the canopy is the Ajuntament's tree inventory,
 // whose CC BY 4.0 makes this line an obligation rather than a courtesy.
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
+// Basemap: self-hosted Protomaps vector tiles, rendered in the browser by protomaps-leaflet.
+// This removes the app's one runtime dependency on someone else's infrastructure — OSMF's
+// donation-funded tile servers — and the desaturated "light" flavor (Positron-like) keeps the
+// green/orange route legible instead of fighting osm-carto's terrain tints and POI icons.
+// The custom WebGL shade overlay below is a separate GridLayer with its own Web Mercator maths;
+// this swap does not touch it.
+//
+// BASEMAP_PMTILES is the single swap point between environments. PMTiles needs HTTP Range
+// requests: locally, any range-capable static server over data/valencia.pmtiles works; in
+// production Cloudflare Pages does NOT serve ranges, so this must point at an R2-backed URL
+// (e.g. https://tiles.porlasombra.com/valencia.pmtiles) — see README "Basemap".
+const BASEMAP_PMTILES = "data/valencia.pmtiles";
+protomapsL.leafletLayer({
+  url: BASEMAP_PMTILES,
+  flavor: "light",
+  lang: "es",
+  maxZoom: 19,   // overzoom past the archive's z15 max, matching the old raster behaviour
   attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · ' +
+               '<a href="https://protomaps.com">Protomaps</a> · ' +
                '<a href="https://www.catastro.hacienda.gob.es/">Catastro</a> · ' +
                '<a href="https://geoportal.valencia.es/">Ajuntament de València</a> · ' +
                '<a href="https://github.com/ikoolik/porlasombra">código</a>',

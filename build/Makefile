@@ -1,5 +1,6 @@
 # Precompute the Valencia shade-routing artifact.
 #   make          - full pipeline (downloads if needed)
+#   make basemap  - cut the self-hosted Protomaps PMTiles basemap (see README "Basemap")
 #   make deploy   - build dist/ and push to Cloudflare Pages
 #   make refresh  - re-pull all sources, rebuild, deploy only if the city changed (for cron)
 #   make clean    - drop derived files, keep downloads
@@ -108,6 +109,24 @@ dist: $(OUT)
 deploy: dist
 	npx wrangler pages deploy $(DIST) --project-name=$(PROJECT) --commit-dirty=true
 
+# --- basemap: self-hosted Protomaps vector tiles (see README "Basemap") --------------------
+# Cut a Valencia extract from the Protomaps daily planet build. Needs go-pmtiles on PATH:
+#   go install github.com/protomaps/go-pmtiles@latest
+# PMTiles requires HTTP Range, which Cloudflare Pages does NOT serve — so this file is NOT
+# copied into dist/ (the `dist` target above only ships valencia.json.gz). In production it is
+# uploaded to R2 out of band; locally, any range-capable static server over ../data works.
+# Planet builds are retained ~7 days, so pin the copy — re-cut on the data-rebuild cadence.
+#   make -C build basemap                  # today's planet build
+#   make -C build basemap PMDATE=20260726  # a specific day
+PMTILES := $(DATA)/valencia.pmtiles
+PMDATE  ?= $(shell date -u +%Y%m%d)
+PMBBOX  := -0.43,39.28,-0.28,39.51
+.PHONY: basemap
+basemap:
+	go-pmtiles extract https://build.protomaps.com/$(PMDATE).pmtiles $(PMTILES) \
+	  --bbox=$(PMBBOX) --maxzoom=15 --download-threads=8
+	@echo "basemap ready: $$(du -h $(PMTILES) | cut -f1) — upload to R2 (see README 'Basemap')"
+
 # --- scheduled refresh: re-pull every source, rebuild, deploy only if the city changed ---
 # Lives in refresh.sh (not inlined) so `make -n refresh` can't execute it: a recipe line containing
 # $(MAKE) is run even under -n, which would delete downloads on a dry run. On a Linux server pass
@@ -124,4 +143,4 @@ clean:
 distclean: clean
 	rm -rf $(DATA)
 
-.PHONY: all dist deploy clean distclean
+.PHONY: all dist deploy basemap clean distclean
