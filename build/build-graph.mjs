@@ -7,6 +7,10 @@ import { metres, bearingOf, offsetCoord, meanBearing, sidesFor, sideOffsetM } fr
 export const CROSS_PENALTY_M = 18; // crossing a road / cutting a corner at a junction
 export const JUNCTION_LINK_M = 45; // max distance to link two side-nodes sharing an OSM node
 export const STITCH_M = 12;        // max gap to weld two otherwise-disconnected components
+export const LOCAL_WELD_M = 4;     // max gap to weld two pavement chains that (nearly) touch,
+                                   // regardless of component — see weldLocal. Kept below the 6 m
+                                   // minimum gap between a street's two sidewalks (2 × the 3 m
+                                   // minimum offset), so it never bridges opposite pavements.
 
 export function buildGraph(ways, nodeCoords) {
   const nodes = [];              // { coord, osmId }
@@ -67,6 +71,48 @@ export function buildGraph(ways, nodeCoords) {
   }
 
   return { nodes, adj, addEdge };
+}
+
+// Close the grid. Two pavement chains often meet at (nearly) the same point — a shared corner
+// split across the L/R chains of crossing streets, a footway touching a kerb — yet were never
+// linked because the two OSM ways don't share a node id there, so `byOsmNode` above never saw
+// them as one junction. stitch() below would weld them, but only across *components*; once
+// junction-linking has already pulled the network into one big component those touch points stay
+// open, and the interior then routes like a tree — a 400 m hop can walk 2 km around the block.
+// This welds them whatever component they are in. A coincident pair (< 1 m) is literally the same
+// place, so the step costs nothing; a short reach across a corner pays the crossing penalty, so
+// the router only takes it when it genuinely shortens the walk. Added directly rather than via
+// addEdge because addEdge drops zero-length edges — and the coincident pairs are the ones that
+// matter most.
+export function weldLocal(graph) {
+  const CELL = 0.00018; // ~20 m, same grid as stitch
+  const grid = new Map();
+  graph.nodes.forEach((nd, i) => {
+    const k = Math.floor(nd.coord[0] / CELL) + ":" + Math.floor(nd.coord[1] / CELL);
+    let c = grid.get(k); if (!c) grid.set(k, c = []);
+    c.push(i);
+  });
+
+  let welds = 0;
+  for (let i = 0; i < graph.nodes.length; i++) {
+    const [lon, lat] = graph.nodes[i].coord;
+    const gx = Math.floor(lon / CELL), gy = Math.floor(lat / CELL);
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+      const cell = grid.get((gx + dx) + ":" + (gy + dy));
+      if (!cell) continue;
+      for (const j of cell) {
+        if (j <= i) continue; // each undirected pair once
+        const d = metres(graph.nodes[i].coord, graph.nodes[j].coord);
+        if (d > LOCAL_WELD_M) continue;
+        if (graph.adj[i].some((e) => e.to === j)) continue; // already linked
+        const pen = d < 1 ? 0 : CROSS_PENALTY_M;
+        graph.adj[i].push({ to: j, len: d, pen });
+        graph.adj[j].push({ to: i, len: d, pen });
+        welds++;
+      }
+    }
+  }
+  return welds;
 }
 
 // ---------- connectivity ----------

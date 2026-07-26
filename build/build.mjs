@@ -10,7 +10,7 @@ import fs from "node:fs";
 import zlib from "node:zlib";
 import path from "node:path";
 import { parseOpl } from "./parse-osm.mjs";
-import { buildGraph, components, stitch, CROSS_PENALTY_M } from "./build-graph.mjs";
+import { buildGraph, weldLocal, components, stitch, CROSS_PENALTY_M } from "./build-graph.mjs";
 import { buildCanopy } from "./parse-trees.mjs";
 import { parseAddresses } from "./parse-addresses.mjs";
 import { joinStreetNames } from "./join-streets.mjs";
@@ -28,6 +28,13 @@ console.log(`  ${ways.length} walkable of ${wayTotal} ways, ${nodeCoords.size} o
 
 console.log("→ graph");
 const graph = buildGraph(ways, nodeCoords);
+
+// Close local gaps first — link pavement chains that touch but sit in the same component, which
+// stitch() (cross-component only) can't. Without this the interior routes like a tree.
+console.log("→ weld local gaps");
+const localWelds = weldLocal(graph);
+console.log(`  ${localWelds} welds`);
+
 let { comp, sizes } = components(graph);
 const before = { comps: sizes.length, largest: Math.max(...sizes) };
 console.log(`  ${graph.nodes.length} nodes, ${sizes.length} components, ` +
