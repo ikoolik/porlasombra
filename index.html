@@ -108,9 +108,16 @@
   .scale { display:flex; justify-content:space-between; margin-top:7px; font:500 11px "DM Sans"; color:var(--muted-3); }
 
   /* Map furniture */
-  .pin { width:26px; height:26px; border-radius:50% 50% 50% 2px; transform:rotate(45deg); border:2px solid #fff;
+  .pin { width:26px; height:26px; border-radius:50% 50% 50% 2px; transform:rotate(-45deg); border:2px solid #fff;
          box-shadow:0 2px 6px rgba(0,0,0,.4); display:flex; align-items:center; justify-content:center; }
-  .pin span { transform:rotate(-45deg); color:#fff; font:700 12px "DM Sans"; }
+  .pin span { transform:rotate(45deg); color:#fff; font:700 12px "DM Sans"; }
+  /* "You are here" dot — blue core, white ring, soft locating pulse. */
+  .userdot { position:relative; width:18px; height:18px; }
+  .userdot .core { position:absolute; inset:0; margin:auto; width:14px; height:14px; border-radius:50%;
+         background:#1a73e8; border:2px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.45); }
+  .userdot .pulse { position:absolute; inset:0; border-radius:50%; background:rgba(26,115,232,.4);
+         animation:userpulse 2.4s ease-out infinite; }
+  @keyframes userpulse { 0% { transform:scale(.55); opacity:.7 } 100% { transform:scale(3); opacity:0 } }
   .leaflet-popup-content-wrapper { border-radius:16px; box-shadow:0 8px 24px rgba(20,24,29,.22); padding:0; }
   .leaflet-popup-content { margin:0; }
   .pop { padding:6px; min-width:184px; }
@@ -825,7 +832,7 @@ function makeShadowLayer() {
 
 const shadowLayer = makeShadowLayer().addTo(map);
 const routeLayer = L.featureGroup().addTo(map); // featureGroup for .getBounds()
-let markerA = null, markerB = null;
+let markerA = null, markerB = null, userDot = null;
 
 // ---------- Time ----------
 // One control: the time of day, always today. Every use case the design targets is "now" or
@@ -1713,8 +1720,20 @@ const coordLabel = (ll) => `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
 
 // ---------- Markers ----------
 function pinIcon(letter, bg) {
-  return L.divIcon({ className: "", iconSize: [26, 26], iconAnchor: [13, 13],
+  // The teardrop points straight down, so the tip — not the centre — anchors on the location.
+  return L.divIcon({ className: "", iconSize: [26, 26], iconAnchor: [13, 31],
     html: `<div class="pin" style="background:${bg}"><span>${letter}</span></div>` });
+}
+
+// Google-style "you are here" dot. Non-interactive and below the A/B pins, so it never swallows a
+// map tap nor hides a marker sitting on the same spot.
+function showUserDot(ll) {
+  if (userDot) { userDot.setLatLng(ll); return; }
+  userDot = L.marker(ll, {
+    icon: L.divIcon({ className: "", iconSize: [18, 18], iconAnchor: [9, 9],
+      html: `<div class="userdot"><div class="pulse"></div><div class="core"></div></div>` }),
+    interactive: false, keyboard: false, zIndexOffset: -1000,
+  }).addTo(map);
 }
 function ensureMarker(kind, ll) {
   const isA = kind === "from";
@@ -1732,9 +1751,11 @@ function ensureMarker(kind, ll) {
 
 // `pinned` marks a label that came from a real place rather than from coordinates, so dragging
 // a searched destination a few metres does not keep claiming it is still that address.
-function setPoint(kind, latlng, label, fit) {
+function setPoint(kind, latlng, label, fit, opts = {}) {
   const ll = L.latLng(latlng);
-  ensureMarker(kind, ll);
+  // A geolocated origin defers its pin: the blue dot stands in until there's a destination and a
+  // real route (see route()). Every other origin — a tap, a drag, a search — pins immediately.
+  if (!opts.deferMarker) ensureMarker(kind, ll);
   const entry = { label, latlng: ll, pinned: false };
   if (kind === "from") from = entry; else to = entry;
   // Whatever the search bar was open to ask has just been answered — by a map tap, a drag or a
@@ -1807,6 +1828,11 @@ async function route(fit) {
 
     const r = dijkstra(src, dst, SHADE_ALPHA, sun.altitude);
     if (!r) throw new Error("No hay ruta — prueba con puntos más cerca de una calle");
+
+    // There's a destination and a real route now, so a deferred origin (the located blue dot) earns
+    // its A pin. ensureMarker is idempotent, so pins that already exist just stay put.
+    ensureMarker("from", from.latlng);
+    ensureMarker("to", to.latlng);
 
     routeLayer.clearLayers();
     drawRoute(r);
@@ -1990,7 +2016,10 @@ function locateOrigin() {
     const ll = L.latLng(pos.coords.latitude, pos.coords.longitude);
     const bb = G && G.meta && G.meta.bbox;   // [s,w,n,e]
     if (bb && (ll.lat < bb[0] || ll.lat > bb[2] || ll.lng < bb[1] || ll.lng > bb[3])) return;
-    setPoint("from", ll, "Tu ubicación", false);
+    showUserDot(ll);
+    // Origin is set so a destination routes from here, but the A pin waits for that route — until
+    // then the blue dot is the origin.
+    setPoint("from", ll, "Tu ubicación", false, { deferMarker: true });
     map.setView(ll, 16);
   }, () => {}, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
 }
