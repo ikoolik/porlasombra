@@ -1,5 +1,7 @@
 # Precompute the Valencia shade-routing artifact.
 #   make          - full pipeline (downloads if needed)
+#   make deploy   - build dist/ and push to Cloudflare Pages
+#   make refresh  - re-pull all sources, rebuild, deploy only if the city changed (for cron)
 #   make clean    - drop derived files, keep downloads
 #   make distclean- drop everything
 #
@@ -105,6 +107,14 @@ dist: $(OUT)
 
 deploy: dist
 	npx wrangler pages deploy $(DIST) --project-name=$(PROJECT) --commit-dirty=true
+
+# --- scheduled refresh: re-pull every source, rebuild, deploy only if the city changed ---
+# Lives in refresh.sh (not inlined) so `make -n refresh` can't execute it: a recipe line containing
+# $(MAKE) is run even under -n, which would delete downloads on a dry run. On a Linux server pass
+# the system CA bundle:  make -C build refresh CA=/etc/ssl/certs/ca-certificates.crt
+.PHONY: refresh
+refresh:
+	CA="$(CA)" sh refresh.sh
 
 clean:
 	rm -rf $(DIST)
