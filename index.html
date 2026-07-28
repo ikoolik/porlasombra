@@ -42,7 +42,7 @@
   /* Overlay stacks. The design is drawn at 390 px; on a wide screen the bars would stretch to
      something unusable, so they cap out and hug the left — the rail the handoff calls for. */
   #top, #bottom { position:absolute; z-index:30; display:flex; flex-direction:column; width:100%; max-width:412px; touch-action:manipulation; }
-  #top { top:14px; left:14px; padding-right:28px; gap:9px; }
+  #top { top:14px; left:14px; right:14px; width:auto; gap:9px; }
   #bottom { left:0; bottom:0; padding:0 12px 12px; gap:10px; max-width:436px; }
   @media (min-width: 760px) { #top { top:18px; } }
 
