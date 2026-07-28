@@ -2051,19 +2051,26 @@ window.addEventListener("resize", layoutAttribution);
 // Geolocation is a convenience, never a requirement: denied, unavailable, or simply somewhere
 // other than Valencia all land in the same place — pick a start yourself.
 function locateOrigin() {
-  if (!navigator.geolocation || from) return;
-  navigator.geolocation.getCurrentPosition((pos) => {
-    if (from) return;
+  if (!navigator.geolocation) return;
+  let seeded = false;   // has the first in-bounds fix been used to seed the origin?
+  navigator.geolocation.watchPosition((pos) => {
     const ll = L.latLng(pos.coords.latitude, pos.coords.longitude);
     const bb = G && G.meta && G.meta.bbox;   // [s,w,n,e]
     if (bb && (ll.lat < bb[0] || ll.lat > bb[2] || ll.lng < bb[1] || ll.lng > bb[3])) return;
+    // Every fix just moves (or creates) the blue dot. This only repositions the marker — it never
+    // touches `from`/`to` and never re-routes, so the drawn path stays put while the dot tracks you.
     showUserDot(ll);
-    track("endpoint_set", { method: "geolocation", target: "from" });
-    // Origin is set so a destination routes from here, but the A pin waits for that route — until
-    // then the blue dot is the origin.
-    setPoint("from", ll, "Tu ubicación", false, { deferMarker: true, source: "geolocation" });
-    map.setView(ll, 16);
-  }, () => {}, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
+    // Only the very first in-bounds fix seeds the origin (and recentres), so a destination routes
+    // from where you started. Later fixes leave the origin alone — the dot moves independently.
+    if (!seeded && !from) {
+      seeded = true;
+      track("endpoint_set", { method: "geolocation", target: "from" });
+      // Origin is set so a destination routes from here, but the A pin waits for that route — until
+      // then the blue dot is the origin.
+      setPoint("from", ll, "Tu ubicación", false, { deferMarker: true, source: "geolocation" });
+      map.setView(ll, 16);
+    }
+  }, () => {}, { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 });
 }
 
 setNow();
