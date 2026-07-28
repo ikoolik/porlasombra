@@ -5,6 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <title>por la sombra · Valencia a la sombra</title>
+
+<!-- Install to home screen as a standalone app (no browser chrome). -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="theme-color" content="#1f9d57" />
+<!-- iOS Safari ignores the manifest; these give it standalone mode, a title, and a home-screen
+     icon. apple-touch-icon must be a raster PNG (iOS does not accept SVG here). -->
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="por la sombra" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
 <!-- Privacy-friendly, cookieless analytics (self-hosted Umami). -->
 <script defer src="https://analytics.loresmith.io/script.js" data-website-id="309509bb-367a-4ee8-8704-431774de0f0d" data-domains="porlasombra.pages.dev"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -200,6 +211,13 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
 <script>
+// ---------- Analytics ----------
+// Thin wrapper over Umami's global. The script is deferred and blockable, so it may simply not
+// be there — never let a missing tracker throw into the app. Cookieless; no personal data in props.
+function track(name, data) {
+  try { if (window.umami) window.umami.track(name, data); } catch (_) {}
+}
+
 // ---------- Config ----------
 // The sidewalk graph, the walkability rules and the crossing penalties all live in the build
 // step now (see build/) — this file only consumes the artifact it produces.
@@ -892,12 +910,12 @@ function redrawShadows() {
   }, 120);
 }
 
-nowBtn.onclick = () => { setNow(); onTimeSettled(); };
+nowBtn.onclick = () => { setNow(); onTimeSettled("now"); };
 // Dragging is cheap (shadows only). Re-routing is not — a corridor's shadows plus two A* passes
 // is seconds, not frames — so the route follows on release. The shadiest path genuinely changes
 // with the sun, so the alternative is showing a route labelled "shadiest" that no longer is.
 timeEl.oninput = () => { setTime(+timeEl.value, false); redrawShadows(); markStale(); };
-timeEl.onchange = onTimeSettled;
+timeEl.onchange = () => onTimeSettled("slider");
 
 // ---------- Geometry helpers ----------
 // Convex hull (monotone chain) over [lng,lat] points. Replaces turf.convex: the shadow pass
@@ -1328,7 +1346,7 @@ function geoSearch(q, limit = 8) {
           const n = geo.num[s + k].toLowerCase();
           const exact = n === wanted;
           if (pass === 0 ? !exact : exact || !n.startsWith(wanted)) continue;
-          out.push({ label: geo.names[i] + ", " + geo.num[s + k], lat: geo.lat[s + k], lon: geo.lon[s + k] });
+          out.push({ label: geo.names[i] + ", " + geo.num[s + k], lat: geo.lat[s + k], lon: geo.lon[s + k], kind: "address" });
           if (out.length >= limit) return out;
         }
       }
@@ -1351,7 +1369,7 @@ function geoSearch(q, limit = 8) {
         if (best >= 0) out.push({
           label: `${geo.names[i]}, ${geo.num[s + best]}`,
           hint: `nearest to ${wanted}`,
-          lat: geo.lat[s + best], lon: geo.lon[s + best],
+          lat: geo.lat[s + best], lon: geo.lon[s + best], kind: "address",
         });
       }
       if (out.length) return out;
@@ -1379,10 +1397,10 @@ function geoSearch(q, limit = 8) {
         label: geo.names[c.i],
         hint: last > 0 ? `nos. ${geo.num[s]}–${geo.num[s + last]}` : `no. ${geo.num[s]}`,
         // The middle entrance stands for the street: on a long one, its ends are a poor guess.
-        lat: geo.lat[s + (n >> 1)], lon: geo.lon[s + (n >> 1)],
+        lat: geo.lat[s + (n >> 1)], lon: geo.lon[s + (n >> 1)], kind: "street",
       });
     } else {
-      out.push({ label: geo.pName[c.i], hint: geo.pLabel[c.i], lat: geo.pLat[c.i], lon: geo.pLon[c.i] });
+      out.push({ label: geo.pName[c.i], hint: geo.pLabel[c.i], lat: geo.pLat[c.i], lon: geo.pLon[c.i], kind: "landmark" });
     }
   }
   return out;
@@ -1746,7 +1764,7 @@ function ensureMarker(kind, ll) {
   m.on("dragend", () => {
     const p = m.getLatLng();
     const cur = isA ? from : to;
-    setPoint(kind, p, cur && cur.pinned ? cur.label : "Punto en el mapa", false);
+    setPoint(kind, p, cur && cur.pinned ? cur.label : "Punto en el mapa", false, { source: "drag" });
   });
   if (isA) markerA = m; else markerB = m;
   return m;
@@ -1765,7 +1783,7 @@ function setPoint(kind, latlng, label, fit, opts = {}) {
   // suggestion. Leaving it open stacks it on top of the trip bar showing the same thing.
   if (searchTarget === kind) searchTarget = null;
   renderTrip();
-  if (from && to) route(fit !== false);
+  if (from && to) route(fit !== false, opts.source || "unknown");
   else if (kind === "to") map.setView(ll, Math.max(map.getZoom(), 16));
 }
 
@@ -1815,7 +1833,7 @@ const fitPad = () => ({
 });
 
 // ---------- Routing ----------
-async function route(fit) {
+async function route(fit, source = "unknown") {
   if (!from || !to || !G || routing) return;
   routing = true;
   markStale();
@@ -1825,12 +1843,12 @@ async function route(fit) {
     const sun = renderShadows(bboxOf(from.latlng, to.latlng), false);
 
     const src = nearestNode(from.latlng), dst = nearestNode(to.latlng);
-    if (src < 0 || dst < 0) throw new Error("Ese punto está fuera del mapa de València");
+    if (src < 0 || dst < 0) { track("route_failed", { reason: "out_of_bbox", source }); throw new Error("Ese punto está fuera del mapa de València"); }
     toast("Buscando la ruta…", true);
     await new Promise((r) => setTimeout(r, 0));
 
     const r = dijkstra(src, dst, SHADE_ALPHA, sun.altitude);
-    if (!r) throw new Error("No hay ruta — prueba con puntos más cerca de una calle");
+    if (!r) { track("route_failed", { reason: "no_route", source }); throw new Error("No hay ruta — prueba con puntos más cerca de una calle"); }
 
     // There's a destination and a real route now, so a deferred origin (the located blue dot) earns
     // its A pin. ensureMarker is idempotent, so pins that already exist just stay put.
@@ -1842,6 +1860,12 @@ async function route(fit) {
     showRoute(r, sun);
     if (fit) map.fitBounds(routeLayer.getBounds(), fitPad());
     drawShadows(sun);
+    track("route_computed", {
+      source,
+      shade: Math.round(r.shadePct * 100),
+      dist_km: Math.round(r.length / 100) / 10,
+      hour: Math.floor(timeMin / 60),
+    });
     toast(sun.altitude <= 0.03 ? "\u{1F319} El sol está bajo el horizonte — todo cuenta como sombra." : "");
   } catch (e) {
     els.routeCard.classList.remove("pending");
@@ -1851,9 +1875,10 @@ async function route(fit) {
 
 // The slider moved and settled: the shadiest route for the new sun is a different route, so it
 // is recomputed rather than relabelled.
-function onTimeSettled() {
+function onTimeSettled(control = "slider") {
+  track("time_change", { control, hour: Math.floor(timeMin / 60) });
   redrawShadows();
-  if (from && to) route(false);
+  if (from && to) route(false, control);
 }
 
 // ---------- Search ----------
@@ -1894,18 +1919,27 @@ function pick(i) {
   els.q.value = "";
   els.qClear.hidden = true;
   searchTarget = null;
-  setPoint(target, [r.lat, r.lon], r.label, true);
+  track("endpoint_set", { method: "search", target, kind: r.kind || "unknown" });
+  setPoint(target, [r.lat, r.lon], r.label, true, { source: "search" });
   const entry = target === "from" ? from : to;
   if (entry) entry.pinned = true;
   renderTrip();
 }
 
+let noResTimer = null;
 els.q.addEventListener("input", () => {
   els.qClear.hidden = !els.q.value;
-  if (els.q.value.trim().length < 2) { closeSugg(); return; }
+  const q = els.q.value.trim();
+  if (q.length < 2) { closeSugg(); clearTimeout(noResTimer); return; }
   results = geoSearch(els.q.value);
   sel = -1;
   renderSugg();
+  // A query that finds nothing is a coverage signal — other towns, or the shops/cafés excluded on
+  // purpose. Debounce so we log the query the user paused on, not every prefix typed through it.
+  clearTimeout(noResTimer);
+  if (!results.length) noResTimer = setTimeout(() => {
+    if (els.q.value.trim() === q) track("search_no_results", { q: q.toLowerCase() });
+  }, 900);
 });
 els.q.addEventListener("focus", () => { if (results.length) renderSugg(); });
 els.q.addEventListener("blur", () => setTimeout(() => {
@@ -1976,7 +2010,11 @@ map.on("click", (e) => {
   wrap.className = "pop";
   wrap.innerHTML = `<div class="plabel">Punto seleccionado</div>
     <div class="prow"><button class="a">Desde aquí</button><button class="b">Hasta aquí</button></div>`;
-  const set = (kind) => { map.closePopup(); setPoint(kind, e.latlng, "Punto en el mapa", true); };
+  const set = (kind) => {
+    map.closePopup();
+    track("endpoint_set", { method: "maptap", target: kind });
+    setPoint(kind, e.latlng, "Punto en el mapa", true, { source: "maptap" });
+  };
   wrap.querySelector("button.a").onclick = () => set("from");
   wrap.querySelector("button.b").onclick = () => set("to");
   L.popup({ closeButton: false, offset: [0, 4] }).setLatLng(e.latlng).setContent(wrap).openOn(map);
@@ -2020,9 +2058,10 @@ function locateOrigin() {
     const bb = G && G.meta && G.meta.bbox;   // [s,w,n,e]
     if (bb && (ll.lat < bb[0] || ll.lat > bb[2] || ll.lng < bb[1] || ll.lng > bb[3])) return;
     showUserDot(ll);
+    track("endpoint_set", { method: "geolocation", target: "from" });
     // Origin is set so a destination routes from here, but the A pin waits for that route — until
     // then the blue dot is the origin.
-    setPoint("from", ll, "Tu ubicación", false, { deferMarker: true });
+    setPoint("from", ll, "Tu ubicación", false, { deferMarker: true, source: "geolocation" });
     map.setView(ll, 16);
   }, () => {}, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
 }

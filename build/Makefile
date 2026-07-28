@@ -94,7 +94,8 @@ DIST    := ../dist
 
 dist: $(OUT)
 	rm -rf $(DIST) && mkdir -p $(DIST)/data
-	cp ../index.html ../_headers ../favicon.svg $(DIST)/
+	cp ../index.html ../_headers ../favicon.svg ../manifest.webmanifest \
+	   ../apple-touch-icon.png ../icon-192.png ../icon-512.png $(DIST)/
 	cp $(OUT) $(DIST)/data/
 	@# Stamp the artifact URL with a content hash. _headers caches /data/* for a day, which is
 	@# right for a 6 MB file that changes quarterly — but the filename never changed, so a
